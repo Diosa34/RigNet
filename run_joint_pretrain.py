@@ -16,6 +16,7 @@ import numpy as np
 from utils.log_utils import AverageMeter
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
+from utils.log_args_to_mlflow import log_args_to_mlflow
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -25,6 +26,10 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets.skeleton_dataset import GraphDataset
 from models.GCN import JointPredNet
 from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average
+
+import mlflow
+import mlflow.pytorch
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -88,33 +93,45 @@ def main(args):
 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
     logger = SummaryWriter(log_dir=args.logdir)
-    for epoch in range(args.start_epoch, args.epochs):
-        lr = scheduler.get_last_lr()
-        print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
-        train_loss = train(train_loader, model, optimizer, args)
-        val_loss = test(val_loader, model, args)
-        test_loss = test(test_loader, model, args)
-        scheduler.step()
-        print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
-        print('Epoch{:d}. val_loss: {:.6f}.'.format(epoch + 1, val_loss))
-        print('Epoch{:d}. test_loss: {:.6f}.'.format(epoch + 1, test_loss))
-        # remember best acc and save checkpoint
-        is_best = val_loss < lowest_loss
-        lowest_loss = min(val_loss, lowest_loss)
-        save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'lowest_loss': lowest_loss, 'optimizer': optimizer.state_dict()},
-                        is_best, checkpoint=args.checkpoint)
 
-        info = {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
-        for tag, value in info.items():
-            logger.add_scalar(tag, value, epoch+1)
+    mlflow.set_experiment(f"RigNet_{args.arch}_pretrain")
+    with mlflow.start_run(run_name=f"joint_{args.arch}_pretrain"):
+        log_args_to_mlflow(args)
+        mlflow.log_param("device", str(device))
+        for epoch in range(args.start_epoch, args.epochs):
+            lr = scheduler.get_last_lr()
+            print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
+            train_loss = train(train_loader, model, optimizer, args)
+            val_loss = test(val_loader, model, args)
+            test_loss = test(test_loader, model, args)
+            scheduler.step()
+            print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
+            print('Epoch{:d}. val_loss: {:.6f}.'.format(epoch + 1, val_loss))
+            print('Epoch{:d}. test_loss: {:.6f}.'.format(epoch + 1, test_loss))
 
-    print("=> loading checkpoint '{}'".format(os.path.join(args.checkpoint, 'model_best.pth.tar')))
-    checkpoint = torch.load(os.path.join(args.checkpoint, 'model_best.pth.tar'))
-    best_epoch = checkpoint['epoch']
-    model.load_state_dict(checkpoint['state_dict'])
-    print("=> loaded checkpoint '{}' (epoch {})".format(os.path.join(args.checkpoint, 'model_best.pth.tar'), best_epoch))
-    test_loss = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
-    print('Best epoch:\n test_loss {:8f}'.format(test_loss))
+            mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+            mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
+            mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
+            mlflow.log_metric("lr", lr[0], step=epoch + 1)
+            
+            # remember best acc and save checkpoint
+            is_best = val_loss < lowest_loss
+            lowest_loss = min(val_loss, lowest_loss)
+            save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'lowest_loss': lowest_loss, 'optimizer': optimizer.state_dict()},
+                            is_best, checkpoint=args.checkpoint)
+    
+            info = {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
+            for tag, value in info.items():
+                logger.add_scalar(tag, value, epoch+1)
+
+        best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
+        print("=> loading checkpoint '{}'".format(best_model_path))
+        checkpoint = torch.load(best_model_path)
+        best_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['state_dict'])
+        print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
+        test_loss = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
+        print('Best epoch:\n test_loss {:8f}'.format(test_loss))
 
 
 def train(train_loader, model, optimizer, args):

@@ -20,8 +20,13 @@ from torch_geometric.data import DataLoader
 from models.ROOT_GCN import ROOTNET
 from utils.log_utils import AverageMeter
 from utils.os_utils import isdir, mkdir_p, isfile
+from utils.log_args_to_mlflow import log_args_to_mlflow
 from torch.utils.tensorboard import SummaryWriter
 from datasets.skeleton_dataset import GraphDataset
+
+import mlflow
+import mlflow.pytorch
+import matplotlib.pyplot as plt
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -82,27 +87,39 @@ def main(args):
         return
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
     logger = SummaryWriter(log_dir=args.logdir)
-    for epoch in range(args.start_epoch, args.epochs):
-        lr = scheduler.get_last_lr()
-        print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
-        train_loss = train(train_loader, model, optimizer, args)
-        val_loss, val_acc = test(val_loader, model)
-        test_loss, test_acc = test(test_loader, model)
-        scheduler.step()
-        print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
-        print('Epoch{:d}. val_loss: {:.6f}. val_acc: {:.6f}'.format(epoch + 1, val_loss, val_acc))
-        print('Epoch{:d}. test_loss: {:.6f}. test_acc: {:.6f}'.format(epoch + 1, test_loss, test_acc))
 
-        # remember best acc and save checkpoint
-        is_best = val_acc > best_acc
-        best_acc = max(val_acc, best_acc)
-        save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'best_acc': best_acc,
-                         'optimizer': optimizer.state_dict()}, is_best, checkpoint=args.checkpoint)
+    mlflow.set_experiment(f"RigNet_rootnet")
+    with mlflow.start_run(run_name=f"rootnet"):
+        log_args_to_mlflow(args)
+        mlflow.log_param("device", str(device))
+        for epoch in range(args.start_epoch, args.epochs):
+            lr = scheduler.get_last_lr()
+            print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
+            train_loss = train(train_loader, model, optimizer, args)
+            val_loss, val_acc = test(val_loader, model)
+            test_loss, test_acc = test(test_loader, model)
+            scheduler.step()
+            print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
+            print('Epoch{:d}. val_loss: {:.6f}. val_acc: {:.6f}'.format(epoch + 1, val_loss, val_acc))
+            print('Epoch{:d}. test_loss: {:.6f}. test_acc: {:.6f}'.format(epoch + 1, test_loss, test_acc))
 
-        info = {'train_loss': train_loss, 'val_loss': val_loss, 'val_accuracy': val_acc,
-                'test_loss': test_loss, 'test_accuracy': test_acc}
-        for tag, value in info.items():
-            logger.add_scalar(tag, value, epoch + 1)
+            mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+            mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
+            mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
+            mlflow.log_metric("val_acc", val_acc, step=epoch + 1)
+            mlflow.log_metric("test_acc", test_acc, step=epoch + 1)
+            mlflow.log_metric("lr", lr[0], step=epoch + 1)
+    
+            # remember best acc and save checkpoint
+            is_best = val_acc > best_acc
+            best_acc = max(val_acc, best_acc)
+            save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'best_acc': best_acc,
+                             'optimizer': optimizer.state_dict()}, is_best, checkpoint=args.checkpoint)
+    
+            info = {'train_loss': train_loss, 'val_loss': val_loss, 'val_accuracy': val_acc,
+                    'test_loss': test_loss, 'test_accuracy': test_acc}
+            for tag, value in info.items():
+                logger.add_scalar(tag, value, epoch + 1)
     print("=> loading checkpoint '{}'".format(os.path.join(args.checkpoint, 'model_best.pth.tar')))
     checkpoint = torch.load(os.path.join(args.checkpoint, 'model_best.pth.tar'))
     best_epoch = checkpoint['epoch']
@@ -110,6 +127,9 @@ def main(args):
     print("=> loaded checkpoint '{}' (epoch {})".format(os.path.join(args.checkpoint, 'model_best.pth.tar'), best_epoch))
     test_loss, test_acc = test(test_loader, model)
     print('Best epoch:\n test_loss {:8f} test_acc {:8f}'.format(test_loss, test_acc))
+    mlflow.log_metric("best_epoch", best_epoch)
+    mlflow.log_metric("best_test_loss", test_loss)
+    mlflow.log_metric("best_test_acc", test_acc)
 
 
 def train(train_loader, model, optimizer, args):
