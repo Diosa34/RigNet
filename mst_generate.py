@@ -28,7 +28,18 @@ from torch_geometric.utils import add_self_loops
 from models.ROOT_GCN import ROOTNET
 from models.PairCls_GCN import PairCls
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+import mlflow
+from models.supplemental_layers.pytorch_chamfer_dist import (
+    compute_cd_j2j,
+    compute_cd_j2b_full,
+    compute_cd_b2b,
+    compute_iou,
+    compute_precision_recall,
+)
+
+
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 
 def predict_joints(model_id, args):
@@ -114,31 +125,29 @@ def create_single_data(mesh, vox, surface_geodesic, pred_joints):
     :param mesh: input mesh loaded by open3d
     :param vox: voxelized mesh
     :param surface_geodesic: geodesic distance matrix of all vertices
-    :param pred_joints: predicted joints
+    :param pred_joints: predicted joints (numpy array, shape [J, 3])
     :return: wrapped data structure
     """
     mesh_v = np.asarray(mesh.vertices)
     mesh_vn = np.asarray(mesh.vertex_normals)
     mesh_f = np.asarray(mesh.triangles)
 
-    # vertices
+    # vertices and normals
     v = np.concatenate((mesh_v, mesh_vn), axis=1)
     v = torch.from_numpy(v).float()
 
-    # topology edges
     print("     gathering topological edges.")
     tpl_e = get_tpl_edges(mesh_v, mesh_f).T
     tpl_e = torch.from_numpy(tpl_e).long()
     tpl_e, _ = add_self_loops(tpl_e, num_nodes=v.size(0))
 
-    # geodesic edges
     print("     gathering geodesic edges.")
     geo_e = get_geo_edges(surface_geodesic, mesh_v).T
     geo_e = torch.from_numpy(geo_e).long()
     geo_e, _ = add_self_loops(geo_e, num_nodes=v.size(0))
 
-    batch = np.zeros(len(v))
-    batch = torch.from_numpy(batch).long()
+    # batch for vertices (all zeros, because there is one object)
+    batch = torch.zeros(len(v), dtype=torch.long)
 
     pair_all = []
     for joint1_id in range(len(pred_joints)):
@@ -147,21 +156,49 @@ def create_single_data(mesh, vox, surface_geodesic, pred_joints):
             bone_samples = sample_on_bone(pred_joints[joint1_id], pred_joints[joint2_id])
             bone_samples_inside, _ = inside_check(bone_samples, vox)
             outside_proportion = len(bone_samples_inside) / (len(bone_samples) + 1e-10)
-            pair = np.array([joint1_id, joint2_id, dist, outside_proportion, 1])
+            pair = np.array([joint1_id, joint2_id, dist, outside_proportion, 1])  # [i, j, dist, outside, label]
             pair_all.append(pair)
     pair_all = np.array(pair_all)
-    pair_all = torch.from_numpy(pair_all).float()
+    pair_all_tensor = torch.from_numpy(pair_all).float()
     num_pair = len(pair_all)
     num_joint = len(pred_joints)
-    if len(pred_joints) < len(mesh_v):
-        pred_joints = np.tile(pred_joints, (round(1.0 * len(mesh_v) / len(pred_joints) + 0.5), 1))
-        pred_joints = pred_joints[:len(mesh_v), :]
-    elif len(pred_joints) > len(mesh_v):
-        pred_joints = pred_joints[:len(mesh_v), :]
-    pred_joints = torch.from_numpy(pred_joints).float()
 
-    data = Data(x=torch.from_numpy(mesh_vn), pos=torch.from_numpy(mesh_v).float(), batch=batch, y=pred_joints,
-                pairs=pair_all, num_pair=[num_pair], tpl_edge_index=tpl_e, geo_edge_index=geo_e, num_joint=[num_joint]).to(device)
+    # creating pair_attr (attributes for the model)
+    # taking columns: [dist, outside_proportion, label] (indexes 2,3,4)
+    pair_attr = pair_all_tensor[:, 2:]  # shape [num_pair, 3]
+
+    # batch for joints and pairs (all zeros because one object)
+    joints_batch = torch.zeros(num_joint, dtype=torch.long)
+    pairs_batch = torch.zeros(num_pair, dtype=torch.long)
+
+    # saving the original joints for the models
+    joints_original = torch.from_numpy(pred_joints).float()
+
+    # expand the joints to the mesh size for the y field (if necessary)
+    if num_joint < len(mesh_v):
+        pred_joints_expanded = np.tile(pred_joints, (int(np.ceil(len(mesh_v) / num_joint)), 1))
+        pred_joints_expanded = pred_joints_expanded[:len(mesh_v), :]
+    elif num_joint > len(mesh_v):
+        pred_joints_expanded = pred_joints[:len(mesh_v), :]
+    else:
+        pred_joints_expanded = pred_joints
+    pred_joints_expanded = torch.from_numpy(pred_joints_expanded).float()
+
+    data = Data(
+        x=torch.from_numpy(mesh_vn),
+        pos=torch.from_numpy(mesh_v).float(),
+        batch=batch,
+        joints=joints_original,          # original joints
+        y=pred_joints_expanded,          # extended (can be used in other places)
+        pairs=pair_all_tensor,           # full information about pairs (indexes + attributes)
+        pair_attr=pair_attr,             # attributes for the model (dist, outside, label)
+        num_pair=[num_pair],
+        tpl_edge_index=tpl_e,
+        geo_edge_index=geo_e,
+        num_joint=[num_joint],
+        joints_batch=joints_batch,
+        pairs_batch=pairs_batch
+    ).to(device)
     return data
 
 
@@ -170,17 +207,28 @@ def run_mst_generate(args):
     generate skeleton in batch
     :param args: input folder path and data folder path
     """
-    test_list = np.loadtxt(os.path.join(args.dataset_folder, 'test_final.txt'), dtype=np.int)
+    test_list = np.loadtxt(os.path.join(args.dataset_folder, 'test_final.txt'), dtype=int)
     root_select_model = ROOTNET()
     root_select_model.to(device)
     root_select_model.eval()
-    root_checkpoint = torch.load(args.rootnet)
+    root_checkpoint = torch.load(args.rootnet, map_location='cpu')
     root_select_model.load_state_dict(root_checkpoint['state_dict'])
     connectivity_model = PairCls()
     connectivity_model.to(device)
     connectivity_model.eval()
-    conn_checkpoint = torch.load(args.bonenet)
+    conn_checkpoint = torch.load(args.bonenet, map_location='cpu')
     connectivity_model.load_state_dict(conn_checkpoint['state_dict'])
+
+    # loading reference data from rig_info_remesh
+    rig_info_folder = os.path.join(args.dataset_folder, 'rig_info_remesh/')
+
+    all_cd_j2j = []
+    all_cd_j2b = []
+    all_cd_b2b = []
+    all_iou = []
+    all_precision = []
+    all_recall = []
+    all_ed = []
 
     for model_id in test_list:
         print(model_id)
@@ -198,7 +246,6 @@ def run_mst_generate(args):
         cost_matrix[pair_idx[:, 0], pair_idx[:, 1]] = connect_prob.data.cpu().numpy().squeeze()
         cost_matrix = cost_matrix + cost_matrix.transpose()
         cost_matrix = -np.log(cost_matrix+1e-10)
-        #cost_matrix = flip_cost_matrix(pred_joints, cost_matrix)
         cost_matrix = increase_cost_for_outside_bone(cost_matrix, pred_joints, vox)
 
         skel = Skel()
@@ -208,9 +255,194 @@ def run_mst_generate(args):
                 skel.root = TreeNode('root', tuple(pred_joints[i]))
                 break
         loadSkel_recur(skel.root, i, None, pred_joints, parent)
-        img = show_obj_skel(mesh_filename, skel.root)
-        cv2.imwrite(os.path.join(args.res_folder, '{:d}_skel.jpg'.format(model_id)), img[:,:,::-1])
+        try:
+            img = show_obj_skel(mesh_filename, skel.root)
+            cv2.imwrite(os.path.join(args.res_folder, '{:d}_skel.jpg'.format(model_id)), img[:,:,::-1])
+        except Exception as e:
+            print(f"Visualization failed for model {model_id}: {e}. Skipping image save.")
         skel.save(os.path.join(args.res_folder, '{:d}_skel.txt'.format(model_id)))
+
+        # loading reference data from rig_info_remesh
+        rig_file = os.path.join(rig_info_folder, '{:d}.txt'.format(model_id))
+        if not os.path.exists(rig_file):
+            print(f"Rig info file not found for model {model_id}, skipping metrics.")
+            continue
+
+        gt_joints = []
+        gt_parent = []
+        gt_root_name = None
+        joint_name_to_idx = {}
+        with open(rig_file, 'r') as f:
+            lines = f.readlines()
+        print(f"  Read {len(lines)} lines from {rig_file}")
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0].lower() in ['joint', 'joints']:
+                # format: joint(s) name x y z
+                name = parts[1]
+                pos = np.array([float(parts[2]), float(parts[3]), float(parts[4])])
+                joint_name_to_idx[name] = len(gt_joints)
+                gt_joints.append(pos)
+                gt_parent.append(-1)  # temporarily, it will be filled in later from hier
+            elif parts[0].lower() == 'root':
+                gt_root_name = parts[1]
+            elif parts[0].lower() in ['hier', 'bone', 'edge', 'parent']:
+                # hier parent child
+                parent_name = parts[1]
+                child_name = parts[2]
+                if parent_name in joint_name_to_idx and child_name in joint_name_to_idx:
+                    parent_idx = joint_name_to_idx[parent_name]
+                    child_idx = joint_name_to_idx[child_name]
+                    gt_parent[child_idx] = parent_idx
+                else:
+                    print(f"  Warning: unknown joint names in hier: {parent_name}, {child_name}")
+            else:
+                # if the string contains two joint names without a keyword (for flexibility)
+                if len(parts) == 2 and parts[0] in joint_name_to_idx and parts[1] in joint_name_to_idx:
+                    parent_idx = joint_name_to_idx[parts[0]]
+                    child_idx = joint_name_to_idx[parts[1]]
+                    gt_parent[child_idx] = parent_idx
+
+        gt_joints = np.array(gt_joints)
+        if gt_root_name is not None and gt_root_name in joint_name_to_idx:
+            gt_root = joint_name_to_idx[gt_root_name]
+        else:
+            # if root is not specified, we search for the root (parent == -1)
+            gt_root = None
+            for i, p in enumerate(gt_parent):
+                if p == -1:
+                    gt_root = i
+                    break
+
+        # building edges from gt_parent
+        gt_edges = []
+        for child, par in enumerate(gt_parent):
+            if par != -1:
+                gt_edges.append((par, child))
+
+        print(f"  Found {len(gt_joints)} joints, {len(gt_edges)} edges, root={gt_root}")
+
+        if len(gt_edges) == 0:
+            print(f"Model {model_id}: no edges in ground truth, skipping metrics.")
+            continue
+
+        # generating predicted edges from parent
+        pred_edges = []
+        for child, par in enumerate(parent):
+            if par != -1:
+                pred_edges.append((par, child))
+
+        if len(pred_edges) == 0:
+            print(f"Skipping metrics for {model_id} due to empty predicted edges.")
+            continue
+
+        # tolerance for IoU/Precision/Recall (scale is the average distance to the center)
+        scale = np.mean(np.linalg.norm(gt_joints, axis=1))
+        tolerance = 0.05 * scale if scale > 0 else 0.01
+
+        cd_j2j = compute_cd_j2j(pred_joints, gt_joints)
+        all_cd_j2j.append(cd_j2j)
+
+        cd_j2b = compute_cd_j2b_full(pred_joints, pred_edges, gt_joints, gt_edges)
+        all_cd_j2b.append(cd_j2b)
+
+        cd_b2b = compute_cd_b2b(pred_joints, pred_edges, gt_joints, gt_edges)
+        all_cd_b2b.append(cd_b2b)
+
+        iou = compute_iou(pred_joints, gt_joints, tolerance)
+        all_iou.append(iou)
+
+        precision, recall = compute_precision_recall(pred_joints, gt_joints, tolerance)
+        all_precision.append(precision)
+        all_recall.append(recall)
+
+        # Tree Edit Distance (ED) with apted
+        if gt_root is not None:
+            try:
+                from apted import APTED
+                from apted.helpers import Tree as AptedTree
+        
+                def convert_to_apted(node):
+                    # all nodes have the same label to count only the structure
+                    apted_node = AptedTree('0')
+                    if hasattr(node, 'children'):
+                        for child in node.children:
+                            apted_node.children.append(convert_to_apted(child))
+                    return apted_node
+        
+                # building a reference tree from gt_edges
+                gt_children = [[] for _ in range(len(gt_joints))]
+                for a, b in gt_edges:
+                    gt_children[a].append(b)
+        
+                def build_tree_from_edges(joints, edges, root_idx):
+                    children = [[] for _ in range(len(joints))]
+                    for a, b in edges:
+                        children[a].append(b)
+                    def recurse(idx):
+                        node = TreeNode(f'joint_{idx}', tuple(joints[idx]))
+                        for child_idx in children[idx]:
+                            node.children.append(recurse(child_idx))
+                        return node
+                    return recurse(root_idx)
+        
+                gt_tree = build_tree_from_edges(gt_joints, gt_edges, gt_root)
+        
+                # building the predicted tree from parent
+                pred_children = [[] for _ in range(len(pred_joints))]
+                for child, par in enumerate(parent):
+                    if par != -1:
+                        pred_children[par].append(child)
+                pred_root_idx = None
+                for i, p in enumerate(parent):
+                    if p == -1:
+                        pred_root_idx = i
+                        break
+                if pred_root_idx is None:
+                    print(f"  No root in predicted skeleton for model {model_id}")
+                    continue
+                pred_tree = build_tree_from_edges(pred_joints, pred_edges, pred_root_idx)
+        
+                apted_pred = convert_to_apted(pred_tree)
+                apted_gt = convert_to_apted(gt_tree)
+        
+                ted = APTED(apted_pred, apted_gt).compute_edit_distance()
+                all_ed.append(ted)
+            except Exception as e:
+                print(f"ED computation failed for {model_id}: {e}")
+
+    mlflow.set_experiment("RigNet_mst_evaluation")
+    with mlflow.start_run(run_name="mst_generation"):
+        mlflow.log_param("dataset_folder", args.dataset_folder)
+        mlflow.log_param("res_folder", args.res_folder)
+        mlflow.log_param("rootnet", args.rootnet)
+        mlflow.log_param("bonenet", args.bonenet)
+        mlflow.log_param("threshold_best", args.threshold_best)
+
+        if all_cd_j2j:
+            mlflow.log_metric("test_CD_J2J", np.mean(all_cd_j2j))
+        if all_cd_j2b:
+            mlflow.log_metric("test_CD_J2B", np.mean(all_cd_j2b))
+        if all_cd_b2b:
+            mlflow.log_metric("test_CD_B2B", np.mean(all_cd_b2b))
+        if all_iou:
+            mlflow.log_metric("test_IoU", np.mean(all_iou))
+        if all_precision:
+            mlflow.log_metric("test_Precision", np.mean(all_precision))
+        if all_recall:
+            mlflow.log_metric("test_Recall", np.mean(all_recall))
+        if all_ed:
+            mlflow.log_metric("test_TreeEditDist", np.mean(all_ed))
+
+        print("Evaluation metrics logged to MLflow.")
+        print(f"Average CD-J2J: {np.mean(all_cd_j2j):.6f}, CD-J2B: {np.mean(all_cd_j2b):.6f}, CD-B2B: {np.mean(all_cd_b2b):.6f}")
+        print(f"Average IoU: {np.mean(all_iou):.6f}, Precision: {np.mean(all_precision):.6f}, Recall: {np.mean(all_recall):.6f}, ED: {np.mean(all_ed):.6f}")
 
 
 if __name__ == '__main__':

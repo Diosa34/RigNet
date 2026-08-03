@@ -28,6 +28,8 @@ import mlflow
 import mlflow.pytorch
 import matplotlib.pyplot as plt
 
+from sklearn.metrics import precision_score, recall_score, f1_score
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -82,8 +84,12 @@ def main(args):
     test_loader = DataLoader(GraphDataset(root=args.test_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss, test_acc = test(test_loader, model)
-        print('test_loss {:.8f}. test_acc: {:.6f}'.format(test_loss, test_acc))
+        test_metrics = test(test_loader, model)
+        print("test_loss: {:.8f}".format(test_metrics['loss']))
+        print("test_accuracy: {:.6f}".format(test_metrics['accuracy']))
+        for k, v in test_metrics.items():
+            if k not in ['loss', 'accuracy']:
+                print(f"{k}: {v:.6f}")
         return
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
     logger = SummaryWriter(log_dir=args.logdir)
@@ -96,18 +102,23 @@ def main(args):
             lr = scheduler.get_last_lr()
             print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
             train_loss = train(train_loader, model, optimizer, args)
-            val_loss, val_acc = test(val_loader, model)
-            test_loss, test_acc = test(test_loader, model)
+            val_metrics  = test(val_loader, model)
+            test_metrics = test(test_loader, model)
+            val_loss = val_metrics['loss']
+            val_acc  = val_metrics['accuracy']
+            test_loss = test_metrics['loss']
+            test_acc  = test_metrics['accuracy']
             scheduler.step()
+
             print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
             print('Epoch{:d}. val_loss: {:.6f}. val_acc: {:.6f}'.format(epoch + 1, val_loss, val_acc))
             print('Epoch{:d}. test_loss: {:.6f}. test_acc: {:.6f}'.format(epoch + 1, test_loss, test_acc))
 
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
-            mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
-            mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
-            mlflow.log_metric("val_acc", val_acc, step=epoch + 1)
-            mlflow.log_metric("test_acc", test_acc, step=epoch + 1)
+            for k, v in val_metrics.items():
+                mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
+            for k, v in test_metrics.items():
+                mlflow.log_metric(f"test_{k}", float(v), step=epoch + 1)
             mlflow.log_metric("lr", lr[0], step=epoch + 1)
     
             # remember best acc and save checkpoint
@@ -116,20 +127,23 @@ def main(args):
             save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'best_acc': best_acc,
                              'optimizer': optimizer.state_dict()}, is_best, checkpoint=args.checkpoint)
     
-            info = {'train_loss': train_loss, 'val_loss': val_loss, 'val_accuracy': val_acc,
-                    'test_loss': test_loss, 'test_accuracy': test_acc}
-            for tag, value in info.items():
-                logger.add_scalar(tag, value, epoch + 1)
-    print("=> loading checkpoint '{}'".format(os.path.join(args.checkpoint, 'model_best.pth.tar')))
-    checkpoint = torch.load(os.path.join(args.checkpoint, 'model_best.pth.tar'))
-    best_epoch = checkpoint['epoch']
-    model.load_state_dict(checkpoint['state_dict'])
-    print("=> loaded checkpoint '{}' (epoch {})".format(os.path.join(args.checkpoint, 'model_best.pth.tar'), best_epoch))
-    test_loss, test_acc = test(test_loader, model)
-    print('Best epoch:\n test_loss {:8f} test_acc {:8f}'.format(test_loss, test_acc))
-    mlflow.log_metric("best_epoch", best_epoch)
-    mlflow.log_metric("best_test_loss", test_loss)
-    mlflow.log_metric("best_test_acc", test_acc)
+            # tensorBoard
+            logger.add_scalar("train/loss", train_loss, epoch + 1)
+            for k, v in val_metrics.items():
+                logger.add_scalar(f"val/{k}", float(v), epoch + 1)
+            for k, v in test_metrics.items():
+                logger.add_scalar(f"test/{k}", float(v), epoch + 1)
+
+        print("=> loading checkpoint '{}'".format(os.path.join(args.checkpoint, 'model_best.pth.tar')))
+        checkpoint = torch.load(os.path.join(args.checkpoint, 'model_best.pth.tar'))
+        best_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['state_dict'])
+        print("=> loaded checkpoint '{}' (epoch {})".format(os.path.join(args.checkpoint, 'model_best.pth.tar'), best_epoch))
+        test_metrics = test(test_loader, model)
+        print('Best epoch:')
+        for k, v in test_metrics.items():
+            print(f"{k}: {v:.8f}")
+        mlflow.log_metric("best_epoch", best_epoch)
 
 
 def train(train_loader, model, optimizer, args):
@@ -144,7 +158,6 @@ def train(train_loader, model, optimizer, args):
         loss_1 = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label, reduction='none')
         topk_val, _ = torch.topk(loss_1.view(-1), k=int(args.topk * len(pre_label)), dim=0, sorted=False)
         loss2 = topk_val.mean()
-        #loss_3 = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label)
         loss = loss_1.mean() + loss2
         loss.backward()
         optimizer.step()
@@ -154,24 +167,45 @@ def train(train_loader, model, optimizer, args):
 
 def test(test_loader, model):
     global device
-    model.eval()  # switch to test mode
+    model.eval()
     loss_meter = AverageMeter()
-    acc_total = 0.0
-    count = 0.0
+
+    all_preds = []
+    all_gts = []
+
     for data in test_loader:
-        #print(data.name)
         data = data.to(device)
         with torch.no_grad():
             pre_label, label = model(data)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label.float())
             loss_meter.update(loss.item())
+
             for i in range(len(torch.unique(data.batch))):
-                pred_root_id = torch.argmax(pre_label[data.joints_batch==i]).item()
-                gt_root_id = torch.argmax(label[data.joints_batch==i]).item()
-                if pred_root_id == gt_root_id:
-                    acc_total += 1.0
-                count += 1.0
-    return loss_meter.avg, acc_total/count
+                logits_i = pre_label[data.joints_batch == i]
+                label_i = label[data.joints_batch == i]
+
+                pred_root_id = torch.argmax(logits_i).item()
+                gt_root_id = torch.argmax(label_i).item()
+
+                all_preds.append(pred_root_id)
+                all_gts.append(gt_root_id)
+
+    preds_np = np.array(all_preds)
+    gts_np = np.array(all_gts)
+
+    accuracy = (preds_np == gts_np).mean()
+    precision = precision_score(gts_np, preds_np, average='macro', zero_division=0)
+    recall = recall_score(gts_np, preds_np, average='macro', zero_division=0)
+    f1 = f1_score(gts_np, preds_np, average='macro', zero_division=0)
+
+    metrics = {
+        'loss': loss_meter.avg,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+    }
+    return metrics
 
 
 if __name__ == '__main__':

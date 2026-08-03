@@ -26,7 +26,14 @@ from utils.log_args_to_mlflow import log_args_to_mlflow
 
 import mlflow
 import mlflow.pytorch
-import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score
+)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -82,8 +89,8 @@ def main(args):
 
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
-        print('test_loss {:8f}'.format(test_loss))
+        test_metrics = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
+        print(test_metrics)
         return
 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
@@ -96,28 +103,40 @@ def main(args):
         for epoch in range(args.start_epoch, args.epochs):
             lr = scheduler.get_last_lr()
             print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
+
             train_loss = train(train_loader, model, optimizer, args)
-            val_loss = test(val_loader, model, args)
-            test_loss = test(test_loader, model, args, best_epoch=epoch+1)
+            
+            val_metrics = test(val_loader, model, args)
+            val_loss = val_metrics["loss"]
+            
+            test_metrics = test(test_loader, model, args, best_epoch=epoch+1)
+            test_loss = test_metrics["loss"]
+            
             scheduler.step()
+            
             print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
             print('Epoch{:d}. val_loss: {:.6f}.'.format(epoch + 1, val_loss))
             print('Epoch{:d}. test_loss: {:.6f}.'.format(epoch + 1, test_loss))
-
+            
+            # log metrics to MLflow
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
-            mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
-            mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
+            for k, v in val_metrics.items():
+                mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
+            for k, v in test_metrics.items():
+                mlflow.log_metric(f"test_{k}", float(v), step=epoch + 1)
             mlflow.log_metric("lr", lr[0], step=epoch + 1)
-    
-            # remember best acc and save checkpoint
+            
+            # log metrics to TensorBoard
+            logger.add_scalar("train/loss", train_loss, epoch + 1)
+            for k, v in val_metrics.items():
+                logger.add_scalar(f"val/{k}", float(v), epoch + 1)
+            for k, v in test_metrics.items():
+                logger.add_scalar(f"test/{k}", float(v), epoch + 1)
+
             is_best = val_loss < lowest_loss
             lowest_loss = min(val_loss, lowest_loss)
             save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'lowest_loss': lowest_loss, 'optimizer': optimizer.state_dict()},
                             is_best, checkpoint=args.checkpoint)
-    
-            info = {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
-            for tag, value in info.items():
-                logger.add_scalar(tag, value, epoch+1)
 
         best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading checkpoint '{}'".format(best_model_path))
@@ -125,27 +144,36 @@ def main(args):
         best_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
-        test_loss = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
-        print('Best epoch:\n test_loss {:8f}'.format(test_loss))
+        test_metrics = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
+
+        print(f"Best epoch: {best_epoch}")
+        print(f"test_loss: {test_metrics['loss']:.6f}")
+        for k, v in test_metrics.items():
+            print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
+
         mlflow.log_metric("best_epoch", best_epoch)
-        mlflow.log_metric("best_test_loss", test_loss)
 
 
 def train(train_loader, model, optimizer, args):
     global device
     model.train()  # switch to train mode
     loss_meter = AverageMeter()
+
     for data in train_loader:
         data = data.to(device)
         optimizer.zero_grad()
         pre_label, label = model(data)
+
         loss1 = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label, reduction='none')
         topk_val, _ = torch.topk(loss1.view(-1), k=int(args.topk * len(pre_label)), dim=0, sorted=False)
         loss2 = topk_val.mean()
         loss = loss1.mean() + loss2
         loss.backward()
         optimizer.step()
+
         loss_meter.update(loss.item())
+
+    # return only avg loss per epoch
     return loss_meter.avg
 
 
@@ -156,12 +184,22 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
         output_folder = 'results/{:s}/best_{:d}/'.format(args.checkpoint.split('/')[-1], best_epoch)
         if not os.path.exists(output_folder):
             mkdir_p(output_folder)
+
     loss_meter = AverageMeter()
+    all_probs = []
+    all_labels = []
+
     for data in test_loader:
         data = data.to(device)
         with torch.no_grad():
             pre_label, label = model(data)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label.float())
+            loss_meter.update(loss.item())
+
+            prob = torch.sigmoid(pre_label).view(-1)
+            all_probs.append(prob.detach().cpu().numpy())
+            all_labels.append(label.view(-1).detach().cpu().numpy())
+
             if save_result:
                 connect_prob = torch.sigmoid(pre_label)
                 acc_joints = 0
@@ -176,8 +214,21 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                     print('saving: {:s}'.format(str(data.name[i].item()) + '_cost.npy'))
                     np.save(os.path.join(output_folder, str(data.name[i].item()) + '_cost.npy'), cost_matrix)
                     acc_joints += num_joint
-            loss_meter.update(loss.item())
-    return loss_meter.avg
+
+    all_probs = np.concatenate(all_probs)
+    all_labels = np.concatenate(all_labels)
+    pred_bin = (all_probs > 0.5).astype(np.uint8)
+
+    metrics = {
+        "loss": loss_meter.avg,
+        "accuracy": accuracy_score(all_labels, pred_bin),
+        "precision": precision_score(all_labels, pred_bin, zero_division=0),
+        "recall": recall_score(all_labels, pred_bin, zero_division=0),
+        "f1": f1_score(all_labels, pred_bin, zero_division=0),
+        "roc_auc": roc_auc_score(all_labels, all_probs)
+    }
+
+    return metrics
 
 
 if __name__ == '__main__':
@@ -206,7 +257,7 @@ if __name__ == '__main__':
                         type=str, help='folder of validation data')
     parser.add_argument('--test_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/test/',
                         type=str, help='folder of testing data')
-
+    
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
     print(parser.parse_args())
     main(parser.parse_args())

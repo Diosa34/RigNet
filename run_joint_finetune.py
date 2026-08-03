@@ -1,6 +1,6 @@
 #-------------------------------------------------------------------------------
 # Name:        run_joint_finetune.py
-# Purpose:     Finetuning regression and attention modules togather with a meanshift module
+# Purpose:     Finetuning regression and attention modules together with a meanshift module
 # RigNet Copyright 2020 University of Massachusetts
 # RigNet is made available under General Public License Version 3 (GPLv3), or under a Commercial License.
 # Please see the LICENSE README.txt file in the main directory for more information and instruction on using and licensing RigNet.
@@ -29,10 +29,11 @@ from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_wit
 
 import mlflow
 import mlflow.pytorch
-import matplotlib.pyplot as plt
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# device = torch.device("cpu")
+
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    torch.cuda.set_device(device)
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -126,8 +127,11 @@ def main(args):
     test_loader = DataLoader(GraphDataset(root=args.test_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
-        print('test_loss {:8f}'.format(test_loss))
+        test_loss, test_metrics = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
+        print('test_loss {:.8f}'.format(test_loss))
+        print('MeanShift metrics:')
+        for k, v in test_metrics.items():
+            print('  {}: {:.6f}'.format(k, v))
         return
 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
@@ -141,29 +145,46 @@ def main(args):
         for epoch in range(args.start_epoch, args.epochs):
             print('\nEpoch: %d ' % (epoch + 1))
             train_loss = train(train_loader, model, optimizer, args)
-            val_loss = test(val_loader, model, args)
-            test_loss = test(test_loader, model, args)
+            val_loss, val_metrics = test(val_loader, model, args)
+            test_loss, test_metrics = test(test_loader, model, args)
             scheduler.step()
             print('Epoch{:d}. train_loss: {:.6f}.'.format(epoch + 1, train_loss))
             print('Epoch{:d}. val_loss: {:.6f}.'.format(epoch + 1, val_loss))
             print('Epoch{:d}. test_loss: {:.6f}.'.format(epoch + 1, test_loss))
+            # print mean shift metrics
+            print('  val_metrics: cd_after={:.6f}, avg_shift_last={:.6f}, total_disp={:.6f}, disp_std={:.6f}'.format(
+                val_metrics['cd_after'], val_metrics['avg_shift_last'],
+                val_metrics['total_disp'], val_metrics['disp_std']))
+            print('  test_metrics: cd_after={:.6f}, avg_shift_last={:.6f}, total_disp={:.6f}, disp_std={:.6f}'.format(
+                test_metrics['cd_after'], test_metrics['avg_shift_last'],
+                test_metrics['total_disp'], test_metrics['disp_std']))
 
+            # log scalar losses
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
             mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
             mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
             mlflow.log_metric("lr_jointnet", optimizer.param_groups[0]['lr'], step=epoch + 1)
             mlflow.log_metric("lr_masknet", optimizer.param_groups[1]['lr'], step=epoch + 1)
             mlflow.log_metric("lr_bandwidth", optimizer.param_groups[2]['lr'], step=epoch + 1)
-    
+
+            # log mean shift metrics
+            for k, v in val_metrics.items():
+                mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
+                logger.add_scalar(f"val/{k}", float(v), epoch + 1)
+            for k, v in test_metrics.items():
+                mlflow.log_metric(f"test_{k}", float(v), step=epoch + 1)
+                logger.add_scalar(f"test/{k}", float(v), epoch + 1)
+
             # remember best acc and save checkpoint
             is_best = val_loss < lowest_loss
             lowest_loss = min(val_loss, lowest_loss)
             save_checkpoint({'epoch': epoch + 1, 'state_dict': model.state_dict(), 'lowest_loss': lowest_loss, 'optimizer': optimizer.state_dict()},
                             is_best, checkpoint=args.checkpoint)
-    
-            info = {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
-            for tag, value in info.items():
-                logger.add_scalar(tag, value, epoch+1)
+
+            # tensorBoard basic loss
+            logger.add_scalar("train/loss", train_loss, epoch + 1)
+            logger.add_scalar("val/loss", val_loss, epoch + 1)
+            logger.add_scalar("test/loss", test_loss, epoch + 1)
 
         best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading checkpoint '{}'".format(best_model_path))
@@ -171,8 +192,11 @@ def main(args):
         best_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
-        test_loss = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
-        print('Best epoch:\n test_loss {:8f}'.format(test_loss))
+        test_loss, test_metrics = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
+        print('Best epoch:\n test_loss {:.8f}'.format(test_loss))
+        print('MeanShift metrics:')
+        for k, v in test_metrics.items():
+            print('  {}: {:.6f}'.format(k, v))
 
 
 def train(train_loader, model, optimizer, args):
@@ -190,7 +214,6 @@ def train(train_loader, model, optimizer, args):
             y_pred_i = y_pred[data.batch == i, :]
             mask_pred_i = mask_pred[data.batch == i]
             loss_total += chamfer_distance_with_average(y_pred_i.unsqueeze(0), joint_gt.unsqueeze(0))
-            torch.cuda.empty_cache()
             clustered_pred = meanshift_cluster(y_pred_i, bandwidth, mask_pred_i, args)
             loss_ms = 0.0
             for j in range(args.meanshift_step):
@@ -207,9 +230,25 @@ def train(train_loader, model, optimizer, args):
 
 
 def test(test_loader, model, args, save_result=False, best_epoch=None):
+    """
+    Evaluate model on test/val set and compute mean shift metrics.
+    Returns:
+        loss_avg: average loss
+        metrics: dict with keys:
+            'cd_after'         - Chamfer distance after mean shift (final)
+            'avg_shift_last'   - average norm of shift between last two mean shift iterations
+            'total_disp'       - average total displacement from initial to final
+            'disp_std'         - standard deviation of total displacements
+    """
     global device
-    model.eval()  # switch to test mode
+    model.eval()
     loss_meter = AverageMeter()
+    # meters for mean shift metrics
+    cd_after_meter = AverageMeter()
+    avg_shift_last_meter = AverageMeter()
+    total_disp_meter = AverageMeter()
+    disp_std_meter = AverageMeter()
+
     outdir = args.checkpoint.split('/')[-1]
     for data in test_loader:
         data = data.to(device)
@@ -221,13 +260,46 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                 joint_gt = data.joints[data.joints_batch == i, :]
                 y_pred_i = y_pred[data.batch == i, :]
                 mask_pred_i = mask_pred[data.batch == i]
-                loss_total += chamfer_distance_with_average(y_pred_i.unsqueeze(0), joint_gt.unsqueeze(0))
-                torch.cuda.empty_cache()
+
+                # chamfer before (for loss)
+                cd_before = chamfer_distance_with_average(y_pred_i.unsqueeze(0), joint_gt.unsqueeze(0))
+                loss_total += cd_before
+
+                # run mean shift
                 clustered_pred = meanshift_cluster(y_pred_i, bandwidth, mask_pred_i, args)
+                y_pred_final = clustered_pred[-1]   # final positions
+
+                # chamfer after mean shift
+                cd_after = chamfer_distance_with_average(y_pred_final.unsqueeze(0), joint_gt.unsqueeze(0))
+                cd_after_meter.update(cd_after.item())
+
+                # mean shift dynamics metrics
+                # 1. avg_shift_last: average norm of displacement between last two steps
+                if len(clustered_pred) >= 2:
+                    shift_last = torch.norm(clustered_pred[-1] - clustered_pred[-2], dim=1).mean().item()
+                else:
+                    shift_last = 0.0
+                avg_shift_last_meter.update(shift_last)
+
+                # 2. total_disp: average norm of total displacement (initial -> final)
+                total_disp = torch.norm(y_pred_final - y_pred_i, dim=1).mean().item()
+                total_disp_meter.update(total_disp)
+
+                # 3. disp_std: std of total displacements
+                disp_norms = torch.norm(y_pred_final - y_pred_i, dim=1)
+                disp_std = disp_norms.std().item()
+                disp_std_meter.update(disp_std)
+
+                # loss from mean shift (as in original)
                 loss_ms = 0.0
                 for j in range(args.meanshift_step):
                     loss_ms += chamfer_distance_with_average(clustered_pred[j].unsqueeze(0), joint_gt.unsqueeze(0))
                 loss_total = loss_total + args.ms_loss_weight * loss_ms / args.meanshift_step
+
+                # cleanup
+                del clustered_pred, y_pred_final
+                torch.cuda.empty_cache()
+
                 if save_result:
                     output_point_cloud_ply(y_pred_i, name=str(data.name[i].item()),
                                            output_folder='results/{:s}/best_{:d}/'.format(outdir, best_epoch))
@@ -235,12 +307,21 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                             mask_pred_i.data.to("cpu").numpy())
                     np.save('results/{:s}/best_{:d}/{:d}_bandwidth.npy'.format(outdir, best_epoch, data.name[i].item()),
                             bandwidth.data.to("cpu").numpy())
+
+            # average loss over graphs in batch
             loss_total /= len(torch.unique(data.batch))
             if args.use_bce:
                 mask_gt = data.mask.unsqueeze(1)
                 loss_total += args.bce_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(mask_pred_nosigmoid, mask_gt.float(), reduction='mean')
             loss_meter.update(loss_total.item())
-    return loss_meter.avg
+
+    metrics = {
+        'cd_after': cd_after_meter.avg,
+        'avg_shift_last': avg_shift_last_meter.avg,
+        'total_disp': total_disp_meter.avg,
+        'disp_std': disp_std_meter.avg,
+    }
+    return loss_meter.avg, metrics
 
 
 if __name__ == '__main__':
