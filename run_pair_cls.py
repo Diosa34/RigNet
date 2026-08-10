@@ -19,6 +19,7 @@ from torch_geometric.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from models.PairCls_GCN import PairCls
+from models.moe_modules import collect_moe_load_balance_loss
 from datasets.skeleton_dataset import GraphDataset
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.log_utils import AverageMeter
@@ -64,7 +65,7 @@ def main(args):
 
     # create model
     
-    model = PairCls()
+    model = PairCls(use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -168,6 +169,11 @@ def train(train_loader, model, optimizer, args):
         topk_val, _ = torch.topk(loss1.view(-1), k=int(args.topk * len(pre_label)), dim=0, sorted=False)
         loss2 = topk_val.mean()
         loss = loss1.mean() + loss2
+        if args.use_moe and args.moe_lb_weight > 0:
+            lb_loss = collect_moe_load_balance_loss(model)
+            if not torch.is_tensor(lb_loss):
+                lb_loss = torch.tensor(lb_loss, device=device)
+            loss = loss + args.moe_lb_weight * lb_loss
         loss.backward()
         optimizer.step()
 
@@ -259,5 +265,9 @@ if __name__ == '__main__':
                         type=str, help='folder of testing data')
     
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
+    parser.add_argument('--no-use-moe', dest='use_moe', action='store_false', default=True)
+    parser.add_argument('--num-experts', default=4, type=int)
+    parser.add_argument('--top-k', default=2, type=int)
+    parser.add_argument('--moe-lb-weight', default=0.01, type=float)
     print(parser.parse_args())
     main(parser.parse_args())

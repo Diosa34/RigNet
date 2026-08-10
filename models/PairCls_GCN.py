@@ -8,9 +8,15 @@
 import numpy as np
 import torch
 from models.gcn_basic_modules import MLP, GCU
+from models.moe_modules import MoEMLP
 from torch.nn import Sequential, Dropout, Linear
 from torch_scatter import scatter_max
 from torch_geometric.nn import PointConv, fps, radius, global_max_pool, knn_interpolate
+
+
+PAIR_DESCRIPTOR_DIM = 8
+MOE_NUM_EXPERTS = 4
+MOE_TOP_K = 2
 
 
 class SAModule(torch.nn.Module):
@@ -99,29 +105,58 @@ class JointEncoder(torch.nn.Module):
 
 
 class PairCls(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, use_moe=True, num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K):
         super(PairCls, self).__init__()
-        self.expand_joint_feature = Sequential(MLP([8, 32, 64, 128, 256])) 
+        self.use_moe = use_moe
+        self.expand_joint_feature = Sequential(MLP([PAIR_DESCRIPTOR_DIM, 32, 64, 128, 256]))
         self.shape_encoder = ShapeEncoder()
         self.joint_encoder = JointEncoder()
         input_concat_dim = 448
-        self.mix_transform = Sequential(MLP([input_concat_dim, 128, 64]), Dropout(0.7), Linear(64, 1))
+        if self.use_moe:
+            self.mix_transform_body = MoEMLP(
+                [input_concat_dim, 128, 64],
+                num_experts=num_experts,
+                top_k=top_k,
+                gate_input_dim=PAIR_DESCRIPTOR_DIM,
+            )
+            self.mix_transform = Sequential(Dropout(0.7), Linear(64, 1))
+        else:
+            self.mix_transform = Sequential(
+                MLP([input_concat_dim, 128, 64]),
+                Dropout(0.7),
+                Linear(64, 1),
+            )
+
+    def _build_pair_descriptor(self, data, permute_joints=True):
+        if permute_joints:
+            rand_permute = (torch.rand(len(data.pairs)) >= 0.5).long().to(data.pairs.device)
+            joints_pair = torch.cat((
+                data.joints[torch.gather(data.pairs, dim=1, index=rand_permute.unsqueeze(dim=1)).squeeze(dim=1).long()],
+                data.joints[torch.gather(data.pairs, dim=1, index=1 - rand_permute.unsqueeze(dim=1)).squeeze(dim=1).long()],
+                data.pair_attr[:, :-1],
+            ), dim=1)
+        else:
+            joints_pair = torch.cat((
+                data.joints[data.pairs[:, 0].long()],
+                data.joints[data.pairs[:, 1].long()],
+                data.pair_attr[:, :-1],
+            ), dim=1)
+        return joints_pair
 
     def forward(self, data, permute_joints=True):
+        joints_pair = self._build_pair_descriptor(data, permute_joints=permute_joints)
+
         joint_feature = self.joint_encoder(data.joints, data.joints_batch)
         joint_feature = torch.repeat_interleave(joint_feature, torch.bincount(data.pairs_batch), dim=0)
         shape_feature = self.shape_encoder(data)
         shape_feature = torch.repeat_interleave(shape_feature, torch.bincount(data.pairs_batch), dim=0)
 
-        if permute_joints:
-            rand_permute = (torch.rand(len(data.pairs))>=0.5).long().to(data.pairs.device)
-            joints_pair = torch.cat((data.joints[torch.gather(data.pairs, dim=1, index=rand_permute.unsqueeze(dim=1)).squeeze(dim=1).long()],
-                                     data.joints[torch.gather(data.pairs, dim=1, index=1-rand_permute.unsqueeze(dim=1)).squeeze(dim=1).long()],
-                                     data.pair_attr[:, :-1]), dim=1)
-        else:
-            joints_pair = torch.cat((data.joints[data.pairs[:,0].long()], data.joints[data.pairs[:,1].long()], data.pair_attr[:, :-1]), dim=1)
         pair_feature = self.expand_joint_feature(joints_pair)
         pair_feature = torch.cat((shape_feature, joint_feature, pair_feature), dim=1)
-        pre_label = self.mix_transform(pair_feature)
+        if self.use_moe:
+            fused_feature = self.mix_transform_body(pair_feature, gate_input=joints_pair)
+            pre_label = self.mix_transform(fused_feature)
+        else:
+            pre_label = self.mix_transform(pair_feature)
         gt_label = data.pair_attr[:, -1].unsqueeze(1)
         return pre_label, gt_label

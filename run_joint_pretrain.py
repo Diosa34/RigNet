@@ -25,6 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets.skeleton_dataset import GraphDataset
 from models.GCN import JointPredNet
+from models.moe_modules import collect_moe_load_balance_loss
 from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average
 
 import mlflow
@@ -69,9 +70,15 @@ def main(args):
 
     # create model
     if args.arch == 'jointnet':
-        model = JointPredNet(out_channels=3, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr)
+        model = JointPredNet(
+            out_channels=3, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr,
+            use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k,
+        )
     elif args.arch == 'masknet':
-        model = JointPredNet(out_channels=1, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr)
+        model = JointPredNet(
+            out_channels=1, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr,
+            use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k,
+        )
 
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -187,6 +194,7 @@ def train(train_loader, model, optimizer, args):
     global device
     model.train()  # switch to train mode
     loss_meter = AverageMeter()
+    lb_loss_meter = AverageMeter()
     for data in train_loader:
         data = data.to(device)
         optimizer.zero_grad()
@@ -204,9 +212,17 @@ def train(train_loader, model, optimizer, args):
                 loss += chamfer_distance_with_average(y_pred_i.unsqueeze(0), joint_gt.unsqueeze(0))
             num_graphs = len(torch.unique(data.batch))
             loss /= num_graphs
+        if args.use_moe and args.moe_lb_weight > 0:
+            lb_loss = collect_moe_load_balance_loss(model)
+            if not torch.is_tensor(lb_loss):
+                lb_loss = torch.tensor(lb_loss, device=device)
+            loss = loss + args.moe_lb_weight * lb_loss
+            lb_loss_meter.update(lb_loss.item())
         loss.backward()
         optimizer.step()
         loss_meter.update(loss.item())
+    if args.use_moe and args.moe_lb_weight > 0:
+        print('  moe_load_balance_loss: {:.6f}'.format(lb_loss_meter.avg))
     return loss_meter.avg
 
 
@@ -370,6 +386,11 @@ if __name__ == '__main__':
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on val/test set')
     parser.add_argument('--input_normal', action='store_true')
     parser.add_argument('--aggr', default='max', type=str)
+    parser.add_argument('--no-use-moe', dest='use_moe', action='store_false', default=True, help='Disable MoE and use original MLP blocks')
+    parser.add_argument('--num-experts', default=4, type=int, help='number of MoE experts')
+    parser.add_argument('--top-k', default=2, type=int, help='top-k experts per token')
+    parser.add_argument('--moe-lb-weight', default=0.01, type=float,
+                        help='auxiliary load-balancing loss weight (Switch Transformer style)')
     ######################
     parser.add_argument('--train_batch', default=2, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=2, type=int, metavar='N', help='test batchsize')

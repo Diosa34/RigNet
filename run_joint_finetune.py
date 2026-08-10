@@ -24,6 +24,7 @@ from torch_geometric.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from models.GCN import JOINTNET_MASKNET_MEANSHIFT
+from models.moe_modules import collect_moe_load_balance_loss
 from datasets.skeleton_dataset import GraphDataset
 from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average
 
@@ -94,7 +95,12 @@ def main(args):
         mkdir_p(args.logdir)
 
     # create model
-    model = JOINTNET_MASKNET_MEANSHIFT()
+    model = JOINTNET_MASKNET_MEANSHIFT(
+        use_moe_jointnet=args.use_moe_jointnet,
+        use_moe_masknet=args.use_moe_masknet,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+    )
     model.to(device)
 
     optimizer = torch.optim.Adam([{'params': model.jointnet.parameters(), 'lr': args.jointnet_lr},
@@ -220,6 +226,11 @@ def train(train_loader, model, optimizer, args):
                 loss_ms += chamfer_distance_with_average(clustered_pred[j].unsqueeze(0), joint_gt.unsqueeze(0))
             loss_total = loss_total + args.ms_loss_weight * loss_ms / args.meanshift_step
         loss_total /= len(torch.unique(data.batch))
+        if args.moe_lb_weight > 0:
+            lb_loss = collect_moe_load_balance_loss(model)
+            if not torch.is_tensor(lb_loss):
+                lb_loss = torch.tensor(lb_loss, device=device)
+            loss_total = loss_total + args.moe_lb_weight * lb_loss
         if args.use_bce:
             mask_gt = data.mask.unsqueeze(1)
             loss_total += args.bce_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(mask_pred_nosigmoid, mask_gt.float(), reduction='mean')
@@ -352,6 +363,11 @@ if __name__ == '__main__':
     parser.add_argument('--ms_loss_weight', default=2.0, type=float)  # weight for chamfer loss after meanshift
     parser.add_argument('--use_bce', action='store_true')  # if using mask supervision during finetuning
     parser.add_argument('--bce_loss_weight', default=0.1, type=float)  # weight for bce loss
+    parser.add_argument('--no-use-moe-jointnet', dest='use_moe_jointnet', action='store_false', default=True, help='Disable MoE in JointNet and use the original MLP blocks')
+    parser.add_argument('--no-use-moe-masknet', dest='use_moe_masknet', action='store_false', default=True, help='Disable MoE in MaskNet and use the original MLP blocks')    
+    parser.add_argument('--num-experts', default=4, type=int, help='number of MoE experts')
+    parser.add_argument('--top-k', default=2, type=int, help='top-k experts per token')
+    parser.add_argument('--moe-lb-weight', default=0.01, type=float)
 
     print(parser.parse_args())
     main(parser.parse_args())
