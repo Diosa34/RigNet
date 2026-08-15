@@ -46,6 +46,11 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 
 def main(args):
     global device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     best_acc = 0.0
 
     # create checkpoint dir and log dir
@@ -234,5 +239,7 @@ if __name__ == '__main__':
                         type=str, help='folder of testing data')
     parser.add_argument('--pos_weight', default=10.0, type=float, help='weight for positive class')
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
-    print(parser.parse_args())
-    main(parser.parse_args())
+    parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
+    args = parser.parse_args()
+    print(args)
+    main(args)

@@ -32,9 +32,7 @@ import mlflow
 import mlflow.pytorch
 
 
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    torch.cuda.set_device(device)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -83,6 +81,11 @@ def meanshift_cluster(pts, bandwidth, weights, args):
 
 def main(args):
     global device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -404,6 +407,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', default=4, type=int, help='number of MoE experts')
     parser.add_argument('--top-k', default=2, type=int, help='top-k experts per token')
     parser.add_argument('--moe-lb-weight', default=0.01, type=float)
+    parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
 
-    print(parser.parse_args())
-    main(parser.parse_args())
+    args = parser.parse_args()
+    print(args)
+    main(args)

@@ -207,6 +207,12 @@ def run_mst_generate(args):
     generate skeleton in batch
     :param args: input folder path and data folder path
     """
+    global device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     test_list = np.loadtxt(os.path.join(args.dataset_folder, 'test_final.txt'), dtype=int)
     root_select_model = ROOTNET()
     root_select_model.to(device)
@@ -452,6 +458,7 @@ if __name__ == '__main__':
     parser.add_argument('--rootnet', default='checkpoints/rootnet/model_best.pth.tar', type=str)
     parser.add_argument('--bonenet', default='checkpoints/bonenet/model_best.pth.tar', type=str)
     parser.add_argument('--threshold_best', default=1e-5, type=float)
+    parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
     args = parser.parse_args()
     print(args)
     run_mst_generate(args)
