@@ -111,7 +111,7 @@ def main(args):
     logger = SummaryWriter(log_dir=args.logdir)
 
     mlflow.set_experiment(f"RigNet_{args.arch}_pretrain")
-    with mlflow.start_run(run_name=f"joint_{args.arch}_pretrain"):
+    with mlflow.start_run(run_name=f"joint_{args.arch}_pretrain_moe"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
         for epoch in range(args.start_epoch, args.epochs):
@@ -344,7 +344,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
             loss_meter.update(loss.item())
 
             if save_result:
-                output_folder = 'results/{:s}/best_{:d}/'.format(outdir, best_epoch)
+                output_folder = 'results/moe/{:s}/best_{:d}/'.format(outdir, best_epoch)
                 if not os.path.exists(output_folder):
                     mkdir_p(output_folder)
                 if args.arch == 'masknet':
@@ -356,7 +356,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                     for i in range(len(torch.unique(data.batch))):
                         y_pred_sample = y_pred[data.batch == i, :]
                         output_point_cloud_ply(y_pred_sample, name=str(data.name[i].item()),
-                                               output_folder='results/{:s}/best_{:d}/'.format(outdir, best_epoch))
+                                               output_folder='results/moe/{:s}/best_{:d}/'.format(outdir, best_epoch))
     metrics["loss"] = loss_meter.avg
 
     if args.arch == "jointnet":
@@ -429,15 +429,15 @@ if __name__ == '__main__':
     ######################
     parser.add_argument('--train_batch', default=2, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=2, type=int, metavar='N', help='test batchsize')
-    parser.add_argument('-c', '--checkpoint', default='checkpoints/test', type=str, metavar='PATH',
+    parser.add_argument('-c', '--checkpoint', default='checkpoints/moe/test', type=str, metavar='PATH',
                         help='path to save checkpoint (default: checkpoint)')
-    parser.add_argument('--logdir', default='logs/test', type=str, metavar='LOG', help='directory to save logs')
+    parser.add_argument('--logdir', default='logs/moe/test', type=str, metavar='LOG', help='directory to save logs')
     parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
-    parser.add_argument('--train_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/train/',
+    parser.add_argument('--train_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/train/',
                         type=str, help='folder of training data')
-    parser.add_argument('--val_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/val/',
+    parser.add_argument('--val_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/val/',
                         type=str, help='folder of validation data')
-    parser.add_argument('--test_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/test/',
+    parser.add_argument('--test_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/test/',
                         type=str, help='folder of testing data')
     print(parser.parse_args())
     main(parser.parse_args())

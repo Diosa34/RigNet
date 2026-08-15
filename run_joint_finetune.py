@@ -144,7 +144,7 @@ def main(args):
     logger = SummaryWriter(log_dir=args.logdir)
 
     mlflow.set_experiment("RigNet_Joint_Finetune")
-    with mlflow.start_run(run_name=f"joint_finetune_{args.checkpoint.split('/')[-1]}"):
+    with mlflow.start_run(run_name=f"joint_finetune_{'moe_jointnet_' if args.use_moe_jointnet else ''}{'moe_masknet_' if args.use_moe_masknet else ''}{args.checkpoint.split('/')[-1]}"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
 
@@ -349,10 +349,10 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
 
                 if save_result:
                     output_point_cloud_ply(y_pred_i, name=str(data.name[i].item()),
-                                           output_folder='results/{:s}/best_{:d}/'.format(outdir, best_epoch))
-                    np.save('results/{:s}/best_{:d}/{:d}_attn.npy'.format(outdir, best_epoch, data.name[i].item()),
+                                           output_folder='results/moe/{:s}/best_{:d}/'.format(outdir, best_epoch))
+                    np.save('results/moe/{:s}/best_{:d}/{:d}_attn.npy'.format(outdir, best_epoch, data.name[i].item()),
                             mask_pred_i.data.to("cpu").numpy())
-                    np.save('results/{:s}/best_{:d}/{:d}_bandwidth.npy'.format(outdir, best_epoch, data.name[i].item()),
+                    np.save('results/moe/{:s}/best_{:d}/{:d}_bandwidth.npy'.format(outdir, best_epoch, data.name[i].item()),
                             bandwidth.data.to("cpu").numpy())
 
             # average loss over graphs in batch
@@ -381,19 +381,19 @@ if __name__ == '__main__':
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on val/test set')
     parser.add_argument('--train_batch', default=1, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=1, type=int, metavar='N', help='test batchsize')
-    parser.add_argument('-c', '--checkpoint', default='checkpoints/test', type=str, metavar='PATH',
+    parser.add_argument('-c', '--checkpoint', default='checkpoints/moe/test', type=str, metavar='PATH',
                         help='path to save checkpoint (default: checkpoint)')
     parser.add_argument('--logdir', default='logs/test', type=str, metavar='LOG', help='directory to save logs')
     parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
-    parser.add_argument('--train_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/train/', type=str, help='folder of training data')
-    parser.add_argument('--val_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/val/', type=str, help='folder of validation data')
-    parser.add_argument('--test_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/test/', type=str, help='folder of testing data')
+    parser.add_argument('--train_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/train/', type=str, help='folder of training data')
+    parser.add_argument('--val_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/val/', type=str, help='folder of validation data')
+    parser.add_argument('--test_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/test/', type=str, help='folder of testing data')
     ######################
     parser.add_argument('--jointnet_lr', default=5e-5, type=float)
     parser.add_argument('--masknet_lr', default=5e-5, type=float)
     parser.add_argument('--bandwidth_lr', default=1e-6, type=float)
-    parser.add_argument('--jointnet_resume', default='checkpoints/pretrain_jointnet/model_best.pth.tar', type=str)
-    parser.add_argument('--masknet_resume', default='checkpoints/pretrain_masknet/model_best.pth.tar', type=str)
+    parser.add_argument('--jointnet_resume', default='checkpoints/moe/pretrain_jointnet/model_best.pth.tar', type=str) # на данный момент pretrain_jointnetсохранено не в moe
+    parser.add_argument('--masknet_resume', default='checkpoints/moe/pretrain_masknet/model_best.pth.tar', type=str)
     parser.add_argument('--meanshift_step', default=15, type=int, help='step size for meanshift update')
     parser.add_argument('--step_size', default=0.3, type=float)  # step size for meanshift
     parser.add_argument('--ms_loss_weight', default=2.0, type=float)  # weight for chamfer loss after meanshift

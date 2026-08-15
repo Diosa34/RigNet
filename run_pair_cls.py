@@ -98,7 +98,7 @@ def main(args):
     logger = SummaryWriter(log_dir=args.logdir)
 
     mlflow.set_experiment(f"RigNet_bonenet")
-    with mlflow.start_run(run_name=f"joint_bonenet"):
+    with mlflow.start_run(run_name=f"joint_bonenet{'_moe' if args.use_moe else ''}"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
         for epoch in range(args.start_epoch, args.epochs):
@@ -221,7 +221,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     global device
     model.eval()  # switch to test mode
     if save_result:
-        output_folder = 'results/{:s}/best_{:d}/'.format(args.checkpoint.split('/')[-1], best_epoch)
+        output_folder = 'results/moe/{:s}/best_{:d}/'.format(args.checkpoint.split('/')[-1], best_epoch)
         if not os.path.exists(output_folder):
             mkdir_p(output_folder)
 
@@ -287,15 +287,15 @@ if __name__ == '__main__':
     ####################################################################################################################
     parser.add_argument('--train_batch', default=2, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=2, type=int, metavar='N', help='test batchsize')
-    parser.add_argument('-c', '--checkpoint', default='checkpoints/connect_test', type=str, metavar='PATH',
+    parser.add_argument('-c', '--checkpoint', default='checkpoints/moe/connect_test', type=str, metavar='PATH',
                         help='path to save checkpoint (default: checkpoint)')
-    parser.add_argument('--logdir', default='logs/connect_test', type=str, metavar='LOG', help='directory to save logs')
+    parser.add_argument('--logdir', default='logs/moe/connect_test', type=str, metavar='LOG', help='directory to save logs')
     parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
-    parser.add_argument('--train_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/train/',
+    parser.add_argument('--train_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/train/',
                         type=str, help='folder of training data')
-    parser.add_argument('--val_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/val/',
+    parser.add_argument('--val_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/val/',
                         type=str, help='folder of validation data')
-    parser.add_argument('--test_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/test/',
+    parser.add_argument('--test_folder', default='/home/jovyan/data-storage/ModelResource_RigNetv1_preproccessed/test/',
                         type=str, help='folder of testing data')
     
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
