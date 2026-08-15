@@ -19,7 +19,7 @@ from torch_geometric.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from models.PairCls_GCN import PairCls
-from models.moe_modules import collect_moe_load_balance_loss
+from models.moe_modules import collect_moe_load_balance_loss, collect_moe_train_metrics
 from datasets.skeleton_dataset import GraphDataset
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.log_utils import AverageMeter
@@ -105,7 +105,7 @@ def main(args):
             lr = scheduler.get_last_lr()
             print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
 
-            train_loss = train(train_loader, model, optimizer, args)
+            train_loss, moe_metrics = train(train_loader, model, optimizer, args)
             
             val_metrics = test(val_loader, model, args)
             val_loss = val_metrics["loss"]
@@ -121,6 +121,17 @@ def main(args):
             
             # log metrics to MLflow
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+            if moe_metrics:
+                mlflow.log_metric(
+                    "train_moe_load_balance_loss",
+                    moe_metrics["load_balance_loss"],
+                    step=epoch + 1,
+                )
+                mlflow.log_metric(
+                    "train_moe_expert_usage_spread",
+                    moe_metrics["expert_usage_spread"],
+                    step=epoch + 1,
+                )
             for k, v in val_metrics.items():
                 mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
             for k, v in test_metrics.items():
@@ -129,6 +140,17 @@ def main(args):
             
             # log metrics to TensorBoard
             logger.add_scalar("train/loss", train_loss, epoch + 1)
+            if moe_metrics:
+                logger.add_scalar(
+                    "train/moe_load_balance_loss",
+                    moe_metrics["load_balance_loss"],
+                    epoch + 1,
+                )
+                logger.add_scalar(
+                    "train/moe_expert_usage_spread",
+                    moe_metrics["expert_usage_spread"],
+                    epoch + 1,
+                )
             for k, v in val_metrics.items():
                 logger.add_scalar(f"val/{k}", float(v), epoch + 1)
             for k, v in test_metrics.items():
@@ -159,6 +181,8 @@ def train(train_loader, model, optimizer, args):
     global device
     model.train()  # switch to train mode
     loss_meter = AverageMeter()
+    lb_loss_meter = AverageMeter()
+    usage_spread_meter = AverageMeter()
 
     for data in train_loader:
         data = data.to(device)
@@ -169,18 +193,28 @@ def train(train_loader, model, optimizer, args):
         topk_val, _ = torch.topk(loss1.view(-1), k=int(args.topk * len(pre_label)), dim=0, sorted=False)
         loss2 = topk_val.mean()
         loss = loss1.mean() + loss2
-        if args.use_moe and args.moe_lb_weight > 0:
-            lb_loss = collect_moe_load_balance_loss(model)
-            if not torch.is_tensor(lb_loss):
-                lb_loss = torch.tensor(lb_loss, device=device)
-            loss = loss + args.moe_lb_weight * lb_loss
+        if args.use_moe:
+            moe_step_metrics = collect_moe_train_metrics(model)
+            if 'load_balance_loss' in moe_step_metrics:
+                lb_loss_meter.update(moe_step_metrics['load_balance_loss'])
+            if 'expert_usage_spread' in moe_step_metrics:
+                usage_spread_meter.update(moe_step_metrics['expert_usage_spread'])
+            if args.moe_lb_weight > 0 and 'load_balance_loss' in moe_step_metrics:
+                lb_loss = collect_moe_load_balance_loss(model)
+                if not torch.is_tensor(lb_loss):
+                    lb_loss = torch.tensor(lb_loss, device=device)
+                loss = loss + args.moe_lb_weight * lb_loss
         loss.backward()
         optimizer.step()
 
         loss_meter.update(loss.item())
 
-    # return only avg loss per epoch
-    return loss_meter.avg
+    moe_metrics = {}
+    if args.use_moe and lb_loss_meter.count > 0:
+        moe_metrics['load_balance_loss'] = lb_loss_meter.avg
+    if args.use_moe and usage_spread_meter.count > 0:
+        moe_metrics['expert_usage_spread'] = usage_spread_meter.avg
+    return loss_meter.avg, moe_metrics
 
 
 def test(test_loader, model, args, save_result=False, best_epoch=None):
