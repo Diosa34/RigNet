@@ -7,18 +7,14 @@
 #-------------------------------------------------------------------------------
 import torch
 from models.gcn_basic_modules import MLP, GCU
-from models.moe_modules import MoEMLP
+from models.moe_modules import MoEMLP, MOE_NUM_EXPERTS, MOE_TOP_K, MOE_ROUTER_NOISE
 from torch_scatter import scatter_max, scatter_mean
 from torch.nn import Sequential, Dropout, Linear, Parameter
 
 
-MOE_NUM_EXPERTS = 4
-MOE_TOP_K = 2
-
-
 class JointPredNet(torch.nn.Module):
     def __init__(self, out_channels, input_normal, arch, aggr='max', use_moe=True,
-                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K):
+                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE):
         super(JointPredNet, self).__init__()
         self.input_normal = input_normal
         self.arch = arch
@@ -39,12 +35,15 @@ class JointPredNet(torch.nn.Module):
                 num_experts=num_experts,
                 top_k=top_k,
                 gate_input_dim=self.input_channel + skip_dim,
+                router_noise=router_noise,
             )
             self.mlp_transform_body = MoEMLP(
                 [transform_input_dim, 1024, 256],
                 num_experts=num_experts,
                 top_k=top_k,
                 gate_input_dim=self.input_channel,
+                router_noise=router_noise,
+                route_deep_layers=True,
             )
             self.mlp_tramsform = Sequential(
                 self.mlp_transform_body,
@@ -97,7 +96,7 @@ class JointPredNet(torch.nn.Module):
 
 class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
     def __init__(self, use_moe=True, use_moe_jointnet=None, use_moe_masknet=None,
-                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K):
+                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE):
         super(JOINTNET_MASKNET_MEANSHIFT, self).__init__()
         if use_moe_jointnet is None:
             use_moe_jointnet = use_moe
@@ -106,10 +105,12 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
         self.jointnet = JointPredNet(
             3, input_normal=False, arch='jointnet', aggr='max',
             use_moe=use_moe_jointnet, num_experts=num_experts, top_k=top_k,
+            router_noise=router_noise,
         )
         self.masknet = JointPredNet(
             1, input_normal=False, arch='masknet', aggr='max',
             use_moe=use_moe_masknet, num_experts=num_experts, top_k=top_k,
+            router_noise=router_noise,
         )
         self.bandwidth = Parameter(torch.Tensor(1))
         self.bandwidth.data.fill_(0.04)

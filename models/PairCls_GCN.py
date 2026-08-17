@@ -8,15 +8,18 @@
 import numpy as np
 import torch
 from models.gcn_basic_modules import MLP, GCU
-from models.moe_modules import MoEMLP
+from models.moe_modules import (
+    MoEMLP,
+    MOE_NUM_EXPERTS_BONENET,
+    MOE_TOP_K_BONENET,
+    MOE_ROUTER_NOISE,
+)
 from torch.nn import Sequential, Dropout, Linear
 from torch_scatter import scatter_max
 from torch_geometric.nn import PointConv, fps, radius, global_max_pool, knn_interpolate
 
 
 PAIR_DESCRIPTOR_DIM = 8
-MOE_NUM_EXPERTS = 4
-MOE_TOP_K = 2
 
 
 class SAModule(torch.nn.Module):
@@ -105,7 +108,8 @@ class JointEncoder(torch.nn.Module):
 
 
 class PairCls(torch.nn.Module):
-    def __init__(self, use_moe=True, num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K):
+    def __init__(self, use_moe=True, num_experts=MOE_NUM_EXPERTS_BONENET,
+                 top_k=MOE_TOP_K_BONENET, router_noise=MOE_ROUTER_NOISE):
         super(PairCls, self).__init__()
         self.use_moe = use_moe
         self.expand_joint_feature = Sequential(MLP([PAIR_DESCRIPTOR_DIM, 32, 64, 128, 256]))
@@ -118,6 +122,8 @@ class PairCls(torch.nn.Module):
                 num_experts=num_experts,
                 top_k=top_k,
                 gate_input_dim=PAIR_DESCRIPTOR_DIM,
+                router_noise=router_noise,
+                route_deep_layers=True,
             )
             self.mix_transform = Sequential(Dropout(0.7), Linear(64, 1))
         else:

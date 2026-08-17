@@ -70,7 +70,12 @@ def main(args):
 
     # create model
     
-    model = PairCls(use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k)
+    model = PairCls(
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        router_noise=args.router_noise,
+    )
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -137,6 +142,12 @@ def main(args):
                     moe_metrics["expert_usage_spread"],
                     step=epoch + 1,
                 )
+                if "router_entropy" in moe_metrics:
+                    mlflow.log_metric(
+                        "train_moe_router_entropy",
+                        moe_metrics["router_entropy"],
+                        step=epoch + 1,
+                    )
             for k, v in val_metrics.items():
                 mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
             for k, v in test_metrics.items():
@@ -156,6 +167,12 @@ def main(args):
                     moe_metrics["expert_usage_spread"],
                     epoch + 1,
                 )
+                if "router_entropy" in moe_metrics:
+                    logger.add_scalar(
+                        "train/moe_router_entropy",
+                        moe_metrics["router_entropy"],
+                        epoch + 1,
+                    )
             for k, v in val_metrics.items():
                 logger.add_scalar(f"val/{k}", float(v), epoch + 1)
             for k, v in test_metrics.items():
@@ -188,6 +205,7 @@ def train(train_loader, model, optimizer, args):
     loss_meter = AverageMeter()
     lb_loss_meter = AverageMeter()
     usage_spread_meter = AverageMeter()
+    router_entropy_meter = AverageMeter()
 
     for data in train_loader:
         data = data.to(device)
@@ -204,6 +222,8 @@ def train(train_loader, model, optimizer, args):
                 lb_loss_meter.update(moe_step_metrics['load_balance_loss'])
             if 'expert_usage_spread' in moe_step_metrics:
                 usage_spread_meter.update(moe_step_metrics['expert_usage_spread'])
+            if 'router_entropy' in moe_step_metrics:
+                router_entropy_meter.update(moe_step_metrics['router_entropy'])
             if args.moe_lb_weight > 0 and 'load_balance_loss' in moe_step_metrics:
                 lb_loss = collect_moe_load_balance_loss(model)
                 if not torch.is_tensor(lb_loss):
@@ -219,6 +239,8 @@ def train(train_loader, model, optimizer, args):
         moe_metrics['load_balance_loss'] = lb_loss_meter.avg
     if args.use_moe and usage_spread_meter.count > 0:
         moe_metrics['expert_usage_spread'] = usage_spread_meter.avg
+    if args.use_moe and router_entropy_meter.count > 0:
+        moe_metrics['router_entropy'] = router_entropy_meter.avg
     return loss_meter.avg, moe_metrics
 
 
@@ -305,9 +327,10 @@ if __name__ == '__main__':
     
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
     parser.add_argument('--no-use-moe', dest='use_moe', action='store_false', default=True)
-    parser.add_argument('--num-experts', default=4, type=int)
-    parser.add_argument('--top-k', default=2, type=int)
-    parser.add_argument('--moe-lb-weight', default=0.01, type=float)
+    parser.add_argument('--num-experts', default=8, type=int)
+    parser.add_argument('--top-k', default=1, type=int)
+    parser.add_argument('--moe-lb-weight', default=0.001, type=float)
+    parser.add_argument('--router-noise', default=0.01, type=float)
     parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
     args = parser.parse_args()
     print(args)
