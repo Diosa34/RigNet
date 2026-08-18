@@ -13,6 +13,7 @@ from models.moe_modules import (
     MOE_NUM_EXPERTS_BONENET,
     MOE_TOP_K_BONENET,
     MOE_ROUTER_NOISE,
+    MOE_ROUTER_TEMPERATURE,
 )
 from torch.nn import Sequential, Dropout, Linear
 from torch_scatter import scatter_max
@@ -109,7 +110,8 @@ class JointEncoder(torch.nn.Module):
 
 class PairCls(torch.nn.Module):
     def __init__(self, use_moe=True, num_experts=MOE_NUM_EXPERTS_BONENET,
-                 top_k=MOE_TOP_K_BONENET, router_noise=MOE_ROUTER_NOISE):
+                 top_k=MOE_TOP_K_BONENET, router_noise=MOE_ROUTER_NOISE,
+                 router_temperature=MOE_ROUTER_TEMPERATURE):
         super(PairCls, self).__init__()
         self.use_moe = use_moe
         self.expand_joint_feature = Sequential(MLP([PAIR_DESCRIPTOR_DIM, 32, 64, 128, 256]))
@@ -123,7 +125,7 @@ class PairCls(torch.nn.Module):
                 top_k=top_k,
                 gate_input_dim=PAIR_DESCRIPTOR_DIM,
                 router_noise=router_noise,
-                route_deep_layers=True,
+                router_temperature=router_temperature,
             )
             self.mix_transform = Sequential(Dropout(0.7), Linear(64, 1))
         else:

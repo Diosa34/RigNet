@@ -7,14 +7,17 @@
 #-------------------------------------------------------------------------------
 import torch
 from models.gcn_basic_modules import MLP, GCU
-from models.moe_modules import MoEMLP, MOE_NUM_EXPERTS, MOE_TOP_K, MOE_ROUTER_NOISE
+from models.moe_modules import (
+    MoEMLP, MOE_NUM_EXPERTS, MOE_TOP_K, MOE_ROUTER_NOISE, MOE_ROUTER_TEMPERATURE,
+)
 from torch_scatter import scatter_max, scatter_mean
 from torch.nn import Sequential, Dropout, Linear, Parameter
 
 
 class JointPredNet(torch.nn.Module):
     def __init__(self, out_channels, input_normal, arch, aggr='max', use_moe=True,
-                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE):
+                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE,
+                 router_temperature=MOE_ROUTER_TEMPERATURE):
         super(JointPredNet, self).__init__()
         self.input_normal = input_normal
         self.arch = arch
@@ -29,6 +32,7 @@ class JointPredNet(torch.nn.Module):
 
         skip_dim = 64 + 256 + 512
         transform_input_dim = 1024 + self.input_channel + skip_dim
+        transform_gate_dim = self.input_channel + 64
         if self.use_moe:
             self.mlp_glb = MoEMLP(
                 [skip_dim, 1024],
@@ -36,14 +40,15 @@ class JointPredNet(torch.nn.Module):
                 top_k=top_k,
                 gate_input_dim=self.input_channel + skip_dim,
                 router_noise=router_noise,
+                router_temperature=router_temperature,
             )
             self.mlp_transform_body = MoEMLP(
                 [transform_input_dim, 1024, 256],
                 num_experts=num_experts,
                 top_k=top_k,
-                gate_input_dim=self.input_channel,
+                gate_input_dim=transform_gate_dim,
                 router_noise=router_noise,
-                route_deep_layers=True,
+                router_temperature=router_temperature,
             )
             self.mlp_tramsform = Sequential(
                 self.mlp_transform_body,
@@ -85,7 +90,7 @@ class JointPredNet(torch.nn.Module):
 
         x_5 = torch.cat([x_global, x, x_1, x_2, x_3], dim=1)
         if self.use_moe:
-            hidden = self.mlp_transform_body(x_5, gate_input=x)
+            hidden = self.mlp_transform_body(x_5, gate_input=torch.cat([x, x_1], dim=1))
             out = self.mlp_tramsform[-1](self.mlp_tramsform[1](hidden))
         else:
             out = self.mlp_tramsform(x_5)
@@ -96,7 +101,8 @@ class JointPredNet(torch.nn.Module):
 
 class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
     def __init__(self, use_moe=True, use_moe_jointnet=None, use_moe_masknet=None,
-                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE):
+                 num_experts=MOE_NUM_EXPERTS, top_k=MOE_TOP_K, router_noise=MOE_ROUTER_NOISE,
+                 router_temperature=MOE_ROUTER_TEMPERATURE):
         super(JOINTNET_MASKNET_MEANSHIFT, self).__init__()
         if use_moe_jointnet is None:
             use_moe_jointnet = use_moe
@@ -105,12 +111,12 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
         self.jointnet = JointPredNet(
             3, input_normal=False, arch='jointnet', aggr='max',
             use_moe=use_moe_jointnet, num_experts=num_experts, top_k=top_k,
-            router_noise=router_noise,
+            router_noise=router_noise, router_temperature=router_temperature,
         )
         self.masknet = JointPredNet(
             1, input_normal=False, arch='masknet', aggr='max',
             use_moe=use_moe_masknet, num_experts=num_experts, top_k=top_k,
-            router_noise=router_noise,
+            router_noise=router_noise, router_temperature=router_temperature,
         )
         self.bandwidth = Parameter(torch.Tensor(1))
         self.bandwidth.data.fill_(0.04)

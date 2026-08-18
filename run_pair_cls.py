@@ -75,6 +75,7 @@ def main(args):
         num_experts=args.num_experts,
         top_k=args.top_k,
         router_noise=args.router_noise,
+        router_temperature=args.router_temperature,
     )
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -327,10 +328,11 @@ if __name__ == '__main__':
     
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
     parser.add_argument('--no-use-moe', dest='use_moe', action='store_false', default=True)
-    parser.add_argument('--num-experts', default=8, type=int)
-    parser.add_argument('--top-k', default=1, type=int)
-    parser.add_argument('--moe-lb-weight', default=0.001, type=float)
-    parser.add_argument('--router-noise', default=0.01, type=float)
+    parser.add_argument('--num-experts', default=4, type=int)
+    parser.add_argument('--top-k', default=2, type=int)
+    parser.add_argument('--moe-lb-weight', default=0.0001, type=float)
+    parser.add_argument('--router-noise', default=0.0, type=float)
+    parser.add_argument('--router-temperature', default=0.5, type=float)
     parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
     args = parser.parse_args()
     print(args)

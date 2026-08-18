@@ -104,6 +104,7 @@ def main(args):
         num_experts=args.num_experts,
         top_k=args.top_k,
         router_noise=args.router_noise,
+        router_temperature=args.router_temperature,
     )
     model.to(device)
 
@@ -422,10 +423,11 @@ if __name__ == '__main__':
     parser.add_argument('--bce_loss_weight', default=0.1, type=float)  # weight for bce loss
     parser.add_argument('--no-use-moe-jointnet', dest='use_moe_jointnet', action='store_false', default=True, help='Disable MoE in JointNet and use the original MLP blocks')
     parser.add_argument('--no-use-moe-masknet', dest='use_moe_masknet', action='store_false', default=True, help='Disable MoE in MaskNet and use the original MLP blocks')    
-    parser.add_argument('--num-experts', default=6, type=int, help='number of MoE experts')
-    parser.add_argument('--top-k', default=1, type=int, help='top-k experts per token')
-    parser.add_argument('--moe-lb-weight', default=0.001, type=float)
-    parser.add_argument('--router-noise', default=0.01, type=float)
+    parser.add_argument('--num-experts', default=4, type=int, help='number of routed MoE experts')
+    parser.add_argument('--top-k', default=2, type=int, help='top-k routed experts per token')
+    parser.add_argument('--moe-lb-weight', default=0.0001, type=float)
+    parser.add_argument('--router-noise', default=0.0, type=float)
+    parser.add_argument('--router-temperature', default=0.5, type=float)
     parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
 
     args = parser.parse_args()

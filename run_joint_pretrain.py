@@ -78,13 +78,13 @@ def main(args):
         model = JointPredNet(
             out_channels=3, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr,
             use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k,
-            router_noise=args.router_noise,
+            router_noise=args.router_noise, router_temperature=args.router_temperature,
         )
     elif args.arch == 'masknet':
         model = JointPredNet(
             out_channels=1, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr,
             use_moe=args.use_moe, num_experts=args.num_experts, top_k=args.top_k,
-            router_noise=args.router_noise,
+            router_noise=args.router_noise, router_temperature=args.router_temperature,
         )
 
     model.to(device)
@@ -448,12 +448,14 @@ if __name__ == '__main__':
     parser.add_argument('--input_normal', action='store_true')
     parser.add_argument('--aggr', default='max', type=str)
     parser.add_argument('--no-use-moe', dest='use_moe', action='store_false', default=True, help='Disable MoE and use original MLP blocks')
-    parser.add_argument('--num-experts', default=6, type=int, help='number of MoE experts')
-    parser.add_argument('--top-k', default=1, type=int, help='top-k experts per token')
-    parser.add_argument('--moe-lb-weight', default=0.001, type=float,
+    parser.add_argument('--num-experts', default=4, type=int, help='number of routed MoE experts')
+    parser.add_argument('--top-k', default=2, type=int, help='top-k routed experts per token')
+    parser.add_argument('--moe-lb-weight', default=0.0001, type=float,
                         help='auxiliary load-balancing loss weight (Switch Transformer style)')
-    parser.add_argument('--router-noise', default=0.01, type=float,
+    parser.add_argument('--router-noise', default=0.0, type=float,
                         help='Gaussian noise added to router logits during training')
+    parser.add_argument('--router-temperature', default=0.5, type=float,
+                        help='router softmax temperature (<1 => sharper routing)')
     ######################
     parser.add_argument('--train_batch', default=2, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=2, type=int, metavar='N', help='test batchsize')
