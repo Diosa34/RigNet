@@ -14,7 +14,7 @@ import shutil
 import argparse
 import time
 
-from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_params, setup_device
+from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_block_params, setup_device, log_best_test_metrics
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
@@ -101,10 +101,11 @@ def main(args):
     model = JOINTNET_MASKNET_MEANSHIFT(mask_mha=args.mask_mha, mha_heads=args.mha_heads)
     model.to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    mha_params = count_mha_params(model.masknet)
+    mha_block = count_mha_block_params(model.masknet)
     print('    Total trainable params: %.2fM (%d)' % (total_params / 1e6, total_params))
     if args.mask_mha:
-        print('    Additional MHA params (MaskNet): %d (%.4fM)' % (mha_params, mha_params / 1e6))
+        print('    MHA params: %d, LayerNorm params: %d, MHA block total: %d' % (
+            mha_block['mha_params'], mha_block['layernorm_params'], mha_block['mha_block_params']))
 
     optimizer = torch.optim.Adam([{'params': model.jointnet.parameters(), 'lr': args.jointnet_lr},
                                   {'params': model.masknet.parameters(), 'lr': args.masknet_lr},
@@ -156,7 +157,9 @@ def main(args):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
         mlflow.log_param("total_trainable_params", total_params)
-        mlflow.log_param("mha_params", mha_params)
+        mlflow.log_param("mha_params", mha_block['mha_params'])
+        mlflow.log_param("layernorm_params", mha_block['layernorm_params'])
+        mlflow.log_param("mha_block_params", mha_block['mha_block_params'])
         mlflow.log_param("mask_mha", args.mask_mha)
 
         for epoch in range(args.start_epoch, args.epochs):
@@ -217,7 +220,15 @@ def main(args):
         best_epoch = checkpoint['epoch']
         load_state_dict_compat(model, checkpoint['state_dict'], prefix='best')
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.time()
         test_loss, test_metrics = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        best_inference_time = time.time() - t0
+        test_metrics['inference_time_sec'] = best_inference_time
+        log_best_test_metrics(test_metrics, inference_time_sec=best_inference_time)
         print('Best epoch:\n test_loss {:.8f}'.format(test_loss))
         print('MeanShift metrics:')
         for k, v in test_metrics.items():
@@ -275,13 +286,14 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     disp_std_meter = AverageMeter()
     # joint metrics after mean-shift clustering
     joint_mean_error_meter = AverageMeter()
-    joint_median_error_meter = AverageMeter()
+    all_joint_errors = []
     joint_precision_meter = AverageMeter()
     joint_recall_meter = AverageMeter()
     joint_f1_meter = AverageMeter()
     pred_joint_count_meter = AverageMeter()
     gt_joint_count_meter = AverageMeter()
-    # mask metrics (when BCE supervision is enabled)
+    joint_count_error_meter = AverageMeter()
+    # mask metrics (GT mask always available in skeleton dataset)
     all_mask_probs = []
     all_mask_labels = []
 
@@ -309,16 +321,18 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                 cd_after = chamfer_distance_with_average(y_pred_final.unsqueeze(0), joint_gt.unsqueeze(0))
                 cd_after_meter.update(cd_after.item())
 
-                # joint position metrics after clustering (Hungarian matching)
+                # joint position metrics after clustering
                 gt_np = joint_gt.detach().cpu().numpy()
                 pred_np = y_pred_final.detach().cpu().numpy()
                 dist_matrix = cdist(gt_np, pred_np)
                 min_gt_to_pred = dist_matrix.min(axis=1)
+                # nearest-neighbor: each GT joint -> closest predicted vertex
                 joint_mean_error_meter.update(min_gt_to_pred.mean())
-                joint_median_error_meter.update(np.median(min_gt_to_pred))
+                all_joint_errors.extend(min_gt_to_pred.tolist())
 
                 scale = np.mean(np.linalg.norm(gt_np, axis=1))
                 tolerance = 0.05 * scale if scale > 0 else 0.01
+                # Hungarian matching via existing RigNet helper
                 precision, recall = compute_precision_recall(pred_np, gt_np, tolerance)
                 joint_precision_meter.update(precision)
                 joint_recall_meter.update(recall)
@@ -326,6 +340,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                 joint_f1_meter.update(f1)
                 pred_joint_count_meter.update(len(pred_np))
                 gt_joint_count_meter.update(len(gt_np))
+                joint_count_error_meter.update(abs(len(pred_np) - len(gt_np)))
 
                 # mean shift dynamics metrics
                 # 1. avg_shift_last: average norm of displacement between last two steps
@@ -367,8 +382,9 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
             if args.use_bce:
                 mask_gt = data.mask.unsqueeze(1)
                 loss_total += args.bce_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(mask_pred_nosigmoid, mask_gt.float(), reduction='mean')
-                all_mask_probs.append(torch.sigmoid(mask_pred_nosigmoid).detach().cpu().numpy().reshape(-1))
-                all_mask_labels.append(mask_gt.detach().cpu().numpy().reshape(-1))
+            mask_gt = data.mask.unsqueeze(1)
+            all_mask_probs.append(torch.sigmoid(mask_pred_nosigmoid).detach().cpu().numpy().reshape(-1))
+            all_mask_labels.append(mask_gt.detach().cpu().numpy().reshape(-1))
             loss_meter.update(loss_total.item())
 
     metrics = {
@@ -377,12 +393,13 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
         'total_disp': total_disp_meter.avg,
         'disp_std': disp_std_meter.avg,
         'mean_joint_error': joint_mean_error_meter.avg,
-        'median_joint_error': joint_median_error_meter.avg,
+        'median_joint_error': float(np.median(all_joint_errors)) if all_joint_errors else 0.0,
         'joint_precision': joint_precision_meter.avg,
         'joint_recall': joint_recall_meter.avg,
         'joint_f1': joint_f1_meter.avg,
         'pred_joint_count': pred_joint_count_meter.avg,
         'gt_joint_count': gt_joint_count_meter.avg,
+        'joint_count_error': joint_count_error_meter.avg,
     }
     if all_mask_probs:
         all_mask_probs = np.concatenate(all_mask_probs)

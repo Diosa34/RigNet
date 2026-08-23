@@ -14,7 +14,7 @@ import argparse
 import time
 import numpy as np
 
-from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_params, setup_device
+from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_block_params, setup_device, log_best_test_metrics
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
@@ -82,10 +82,11 @@ def main(args):
 
     model.to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    mha_params = count_mha_params(model)
+    mha_block = count_mha_block_params(model)
     print('    Total trainable params: %.2fM (%d)' % (total_params / 1e6, total_params))
     if use_mha:
-        print('    Additional MHA params: %d (%.4fM)' % (mha_params, mha_params / 1e6))
+        print('    MHA params: %d, LayerNorm params: %d, MHA block total: %d' % (
+            mha_block['mha_params'], mha_block['layernorm_params'], mha_block['mha_block_params']))
     elif args.mask_mha and args.arch != 'masknet':
         print('    Note: --mask_mha ignored for arch=%s (MHA is MaskNet-only)' % args.arch)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -127,7 +128,9 @@ def main(args):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
         mlflow.log_param("total_trainable_params", total_params)
-        mlflow.log_param("mha_params", mha_params)
+        mlflow.log_param("mha_params", mha_block['mha_params'])
+        mlflow.log_param("layernorm_params", mha_block['layernorm_params'])
+        mlflow.log_param("mha_block_params", mha_block['mha_block_params'])
         mlflow.log_param("mask_mha", use_mha)
         for epoch in range(args.start_epoch, args.epochs):
             lr = scheduler.get_last_lr()
@@ -198,6 +201,9 @@ def main(args):
         best_epoch = checkpoint['epoch']
         load_state_dict_compat(model, checkpoint['state_dict'], prefix='best')
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.time()
         test_metrics = test(
             test_loader,
             model,
@@ -205,6 +211,11 @@ def main(args):
             save_result=True,
             best_epoch=best_epoch
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        best_inference_time = time.time() - t0
+        test_metrics['inference_time_sec'] = best_inference_time
+        log_best_test_metrics(test_metrics, inference_time_sec=best_inference_time)
         
         print(f"Best epoch: {best_epoch}")
         print(f"test_loss: {test_metrics['loss']:.6f}")
@@ -254,7 +265,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     # jointnet
     joint_cd = []
     joint_mean_error = []
-    joint_median_error = []
+    all_joint_errors = []
     
     joint_recall_001 = []
     joint_recall_0025 = []
@@ -306,9 +317,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                     joint_mean_error.append(
                         min_gt_to_pred.mean()
                     )
-                    joint_median_error.append(
-                        np.median(min_gt_to_pred)
-                    )
+                    all_joint_errors.extend(min_gt_to_pred.tolist())
                 
                     joint_recall_001.append(
                         (min_gt_to_pred < 0.01).mean()
@@ -350,9 +359,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
             joint_mean_error
         )
 
-        metrics["median_joint_error"] = np.mean(
-            joint_median_error
-        )
+        metrics["median_joint_error"] = float(np.median(all_joint_errors)) if all_joint_errors else 0.0
     
         metrics["recall_0.01"] = np.mean(
             joint_recall_001

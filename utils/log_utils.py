@@ -48,14 +48,48 @@ def load_state_dict_compat(model, state_dict, prefix=''):
     return missing, unexpected
 
 
-def count_mha_params(model):
-    """Count parameters in MHA + LayerNorm blocks (if present)."""
-    total = 0
-    for name in ('mha', 'mha_norm'):
-        module = getattr(model, name, None)
-        if module is not None:
-            total += sum(p.numel() for p in module.parameters())
-    return total
+def count_mha_block_params(model):
+    """Count MHA block parameters split by submodule."""
+    mha_params = 0
+    layernorm_params = 0
+    mha = getattr(model, 'mha', None)
+    mha_norm = getattr(model, 'mha_norm', None)
+    if mha is not None:
+        mha_params = sum(p.numel() for p in mha.parameters())
+    if mha_norm is not None:
+        layernorm_params = sum(p.numel() for p in mha_norm.parameters())
+    return {
+        'mha_params': mha_params,
+        'layernorm_params': layernorm_params,
+        'mha_block_params': mha_params + layernorm_params,
+    }
+
+
+def log_best_test_metrics(metrics, inference_time_sec=None):
+    """Log final best-checkpoint test metrics to MLflow with best_test_ prefix."""
+    joint_metric_map = {
+        'mean_joint_error': 'best_test_mean_joint_error',
+        'median_joint_error': 'best_test_median_joint_error',
+        'joint_precision': 'best_test_joint_precision',
+        'joint_recall': 'best_test_joint_recall',
+        'joint_f1': 'best_test_joint_f1',
+        'pred_joint_count': 'best_test_pred_joint_count',
+        'gt_joint_count': 'best_test_gt_joint_count',
+        'joint_count_error': 'best_test_joint_count_error',
+        'mask_precision': 'best_test_mask_precision',
+        'mask_recall': 'best_test_mask_recall',
+        'mask_f1': 'best_test_mask_f1',
+        'precision': 'best_test_precision',
+        'recall': 'best_test_recall',
+        'f1': 'best_test_f1',
+        'pr_auc': 'best_test_pr_auc',
+        'loss': 'best_test_loss',
+    }
+    for src_key, dst_key in joint_metric_map.items():
+        if src_key in metrics:
+            mlflow.log_metric(dst_key, float(metrics[src_key]))
+    if inference_time_sec is not None:
+        mlflow.log_metric('best_test_inference_time_sec', float(inference_time_sec))
 
 
 def setup_device(gpu_id=0):
