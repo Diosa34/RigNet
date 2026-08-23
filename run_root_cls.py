@@ -18,7 +18,7 @@ import torch.backends.cudnn as cudnn
 from torch_geometric.data import DataLoader
 
 from models.ROOT_GCN import ROOTNET
-from utils.log_utils import AverageMeter
+from utils.log_utils import AverageMeter, setup_device
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.log_args_to_mlflow import log_args_to_mlflow
 from torch.utils.tensorboard import SummaryWriter
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 
 from sklearn.metrics import precision_score, recall_score, f1_score
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = None
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -46,6 +46,8 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 
 def main(args):
     global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     best_acc = 0.0
 
     # create checkpoint dir and log dir
@@ -234,5 +236,7 @@ if __name__ == '__main__':
                         type=str, help='folder of testing data')
     parser.add_argument('--pos_weight', default=10.0, type=float, help='weight for positive class')
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
     print(parser.parse_args())
     main(parser.parse_args())

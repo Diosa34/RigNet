@@ -29,6 +29,8 @@ from models.ROOT_GCN import ROOTNET
 from models.PairCls_GCN import PairCls
 
 import mlflow
+from scipy.spatial.distance import cdist
+from utils.log_utils import setup_device
 from models.supplemental_layers.pytorch_chamfer_dist import (
     compute_cd_j2j,
     compute_cd_j2b_full,
@@ -38,8 +40,7 @@ from models.supplemental_layers.pytorch_chamfer_dist import (
 )
 
 
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = None
 
 
 def predict_joints(model_id, args):
@@ -207,6 +208,9 @@ def run_mst_generate(args):
     generate skeleton in batch
     :param args: input folder path and data folder path
     """
+    global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     test_list = np.loadtxt(os.path.join(args.dataset_folder, 'test_final.txt'), dtype=int)
     root_select_model = ROOTNET()
     root_select_model.to(device)
@@ -228,6 +232,10 @@ def run_mst_generate(args):
     all_iou = []
     all_precision = []
     all_recall = []
+    all_f1 = []
+    all_median_error = []
+    all_pred_joint_count = []
+    all_gt_joint_count = []
     all_ed = []
 
     for model_id in test_list:
@@ -361,6 +369,14 @@ def run_mst_generate(args):
         precision, recall = compute_precision_recall(pred_joints, gt_joints, tolerance)
         all_precision.append(precision)
         all_recall.append(recall)
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+        all_f1.append(f1)
+
+        dist_matrix = cdist(gt_joints, pred_joints)
+        min_gt_to_pred = dist_matrix.min(axis=1)
+        all_median_error.append(np.median(min_gt_to_pred))
+        all_pred_joint_count.append(len(pred_joints))
+        all_gt_joint_count.append(len(gt_joints))
 
         # Tree Edit Distance (ED) with apted
         if gt_root is not None:
@@ -437,12 +453,21 @@ def run_mst_generate(args):
             mlflow.log_metric("test_Precision", np.mean(all_precision))
         if all_recall:
             mlflow.log_metric("test_Recall", np.mean(all_recall))
+        if all_f1:
+            mlflow.log_metric("test_F1", np.mean(all_f1))
+        if all_median_error:
+            mlflow.log_metric("test_MedianJointError", np.mean(all_median_error))
+        if all_pred_joint_count:
+            mlflow.log_metric("test_PredJointCount", np.mean(all_pred_joint_count))
+        if all_gt_joint_count:
+            mlflow.log_metric("test_GTJointCount", np.mean(all_gt_joint_count))
         if all_ed:
             mlflow.log_metric("test_TreeEditDist", np.mean(all_ed))
 
         print("Evaluation metrics logged to MLflow.")
         print(f"Average CD-J2J: {np.mean(all_cd_j2j):.6f}, CD-J2B: {np.mean(all_cd_j2b):.6f}, CD-B2B: {np.mean(all_cd_b2b):.6f}")
-        print(f"Average IoU: {np.mean(all_iou):.6f}, Precision: {np.mean(all_precision):.6f}, Recall: {np.mean(all_recall):.6f}, ED: {np.mean(all_ed):.6f}")
+        print(f"Average IoU: {np.mean(all_iou):.6f}, Precision: {np.mean(all_precision):.6f}, Recall: {np.mean(all_recall):.6f}, F1: {np.mean(all_f1):.6f}, MedianError: {np.mean(all_median_error):.6f}, ED: {np.mean(all_ed):.6f}")
+        print(f"Avg pred joints: {np.mean(all_pred_joint_count):.2f}, avg GT joints: {np.mean(all_gt_joint_count):.2f}")
 
 
 if __name__ == '__main__':
@@ -452,6 +477,8 @@ if __name__ == '__main__':
     parser.add_argument('--rootnet', default='checkpoints/rootnet/model_best.pth.tar', type=str)
     parser.add_argument('--bonenet', default='checkpoints/bonenet/model_best.pth.tar', type=str)
     parser.add_argument('--threshold_best', default=1e-5, type=float)
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
     args = parser.parse_args()
     print(args)
     run_mst_generate(args)

@@ -12,6 +12,8 @@ import trimesh
 import numpy as np
 import open3d as o3d
 import itertools as it
+import time
+import argparse
 
 import torch
 from torch_geometric.data import Data
@@ -36,6 +38,7 @@ from models.GCN import JOINTNET_MASKNET_MEANSHIFT as JOINTNET
 from models.ROOT_GCN import ROOTNET
 from models.PairCls_GCN import PairCls as BONENET
 from models.SKINNING import SKINNET
+from utils.log_utils import setup_device
 
 
 def normalize_obj(mesh_v):
@@ -373,7 +376,16 @@ def tranfer_to_ori_mesh(filename_ori, filename_remesh, pred_rig):
 
 
 if __name__ == '__main__':
-    input_folder = "quick_start/"
+    parser = argparse.ArgumentParser(description='RigNet quick start inference')
+    parser.add_argument('--mask_mha', action='store_true',
+                        help='Enable 2-head MHA in MaskNet (must match checkpoint)')
+    parser.add_argument('--mha_heads', default=2, type=int)
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
+    parser.add_argument('--input_folder', default='quick_start/', type=str)
+    cli_args, _ = parser.parse_known_args()
+
+    input_folder = cli_args.input_folder
 
     # downsample_skinning is used to speed up the calculation of volumetric geodesic distance
     # and to save cpu memory in skinning calculation.
@@ -382,14 +394,19 @@ if __name__ == '__main__':
 
     # load all weights
     print("loading all networks...")
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = setup_device(cli_args.gpu)
+    print('Using device: %s' % device)
 
-    jointNet = JOINTNET()
+    jointNet = JOINTNET(mask_mha=cli_args.mask_mha, mha_heads=cli_args.mha_heads)
     jointNet.to(device)
     jointNet.eval()
-    jointNet_checkpoint = torch.load('checkpoints/gcn_meanshift/model_best.pth.tar')
-    jointNet.load_state_dict(jointNet_checkpoint['state_dict'])
-    print("     joint prediction network loaded.")
+    jointNet_checkpoint = torch.load('checkpoints/gcn_meanshift/model_best.pth.tar', map_location=device)
+    missing, unexpected = jointNet.load_state_dict(jointNet_checkpoint['state_dict'], strict=False)
+    if missing:
+        print(f'     checkpoint missing keys ({len(missing)}): {missing[:5]}{"..." if len(missing) > 5 else ""}')
+    if unexpected:
+        print(f'     checkpoint unexpected keys ({len(unexpected)}): {unexpected[:5]}{"..." if len(unexpected) > 5 else ""}')
+    print("     joint prediction network loaded (mask_mha=%s)." % cli_args.mask_mha)
 
     rootNet = ROOTNET()
     rootNet.to(device)
@@ -450,8 +467,15 @@ if __name__ == '__main__':
     data.to(device)
 
     print("predicting joints")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t_infer_start = time.time()
     data = predict_joints(data, vox, jointNet, threshold, bandwidth=bandwidth,
                           mesh_filename=mesh_filename.replace("_remesh.obj", "_normalized.obj"))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    infer_time = time.time() - t_infer_start
+    print("     joint prediction inference time: {:.3f}s".format(infer_time))
     data.to(device)
     print("predicting connectivity")
     pred_skeleton = predict_skeleton(data, vox, rootNet, boneNet,

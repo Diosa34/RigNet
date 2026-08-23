@@ -11,9 +11,10 @@ sys.path.append("./")
 import os
 import shutil
 import argparse
+import time
 import numpy as np
 
-from utils.log_utils import AverageMeter
+from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_params, setup_device
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
@@ -40,7 +41,7 @@ from sklearn.metrics import (
 
 from scipy.spatial.distance import cdist
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = None
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -56,6 +57,8 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 
 def main(args):
     global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -68,35 +71,51 @@ def main(args):
         mkdir_p(args.logdir)
 
     # create model
+    use_mha = args.mask_mha and args.arch == 'masknet'
     if args.arch == 'jointnet':
         model = JointPredNet(out_channels=3, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr)
     elif args.arch == 'masknet':
-        model = JointPredNet(out_channels=1, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr)
+        model = JointPredNet(
+            out_channels=1, input_normal=args.input_normal, arch=args.arch, aggr=args.aggr,
+            use_mha=use_mha, mha_heads=args.mha_heads,
+        )
 
     model.to(device)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    mha_params = count_mha_params(model)
+    print('    Total trainable params: %.2fM (%d)' % (total_params / 1e6, total_params))
+    if use_mha:
+        print('    Additional MHA params: %d (%.4fM)' % (mha_params, mha_params / 1e6))
+    elif args.mask_mha and args.arch != 'masknet':
+        print('    Note: --mask_mha ignored for arch=%s (MHA is MaskNet-only)' % args.arch)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
         if isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(args.resume, map_location=device)
             args.start_epoch = checkpoint['epoch']
             lowest_loss = checkpoint['lowest_loss']
-            model.load_state_dict(checkpoint['state_dict'])
+            load_state_dict_compat(model, checkpoint['state_dict'], prefix='resume')
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
-    print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
     train_loader = DataLoader(GraphDataset(root=args.train_folder), batch_size=args.train_batch, shuffle=True, follow_batch=['joints'])
     val_loader = DataLoader(GraphDataset(root=args.val_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     test_loader = DataLoader(GraphDataset(root=args.test_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     if args.evaluate:
         print('\nEvaluation only')
-        test_metrics = test( test_loader, model, args, save_result=True, best_epoch=args.start_epoch ) 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.time()
+        test_metrics = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        test_metrics['inference_time_sec'] = time.time() - t0
         print(test_metrics)
         return
 
@@ -107,10 +126,19 @@ def main(args):
     with mlflow.start_run(run_name=f"joint_{args.arch}_pretrain"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
+        mlflow.log_param("total_trainable_params", total_params)
+        mlflow.log_param("mha_params", mha_params)
+        mlflow.log_param("mask_mha", use_mha)
         for epoch in range(args.start_epoch, args.epochs):
             lr = scheduler.get_last_lr()
             print('\nEpoch: %d | LR: %.8f' % (epoch + 1, lr[0]))
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+            epoch_start = time.time()
             train_loss = train(train_loader, model, optimizer, args)
+            epoch_time = time.time() - epoch_start
+            peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+            print('Epoch{:d}. train_time: {:.2f}s, peak_gpu_mem: {:.1f} MB'.format(epoch + 1, epoch_time, peak_mem_mb))
             val_metrics  = test(val_loader, model, args)
             test_metrics = test(test_loader, model, args)
             val_loss = val_metrics["loss"]
@@ -122,6 +150,8 @@ def main(args):
             print('Epoch{:d}. test_loss: {:.6f}.'.format(epoch + 1, test_loss))
 
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+            mlflow.log_metric("train_epoch_time_sec", epoch_time, step=epoch + 1)
+            mlflow.log_metric("peak_gpu_mem_mb", peak_mem_mb, step=epoch + 1)
             for k, v in val_metrics.items():
                 mlflow.log_metric(
                     f"val_{k}",
@@ -164,9 +194,9 @@ def main(args):
 
         best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading checkpoint '{}'".format(best_model_path))
-        checkpoint = torch.load(best_model_path)
+        checkpoint = torch.load(best_model_path, map_location=device)
         best_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
+        load_state_dict_compat(model, checkpoint['state_dict'], prefix='best')
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
         test_metrics = test(
             test_loader,
@@ -224,6 +254,7 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     # jointnet
     joint_cd = []
     joint_mean_error = []
+    joint_median_error = []
     
     joint_recall_001 = []
     joint_recall_0025 = []
@@ -275,6 +306,9 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                     joint_mean_error.append(
                         min_gt_to_pred.mean()
                     )
+                    joint_median_error.append(
+                        np.median(min_gt_to_pred)
+                    )
                 
                     joint_recall_001.append(
                         (min_gt_to_pred < 0.01).mean()
@@ -314,6 +348,10 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     
         metrics["mean_joint_error"] = np.mean(
             joint_mean_error
+        )
+
+        metrics["median_joint_error"] = np.mean(
+            joint_median_error
         )
     
         metrics["recall_0.01"] = np.mean(
@@ -370,6 +408,12 @@ if __name__ == '__main__':
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on val/test set')
     parser.add_argument('--input_normal', action='store_true')
     parser.add_argument('--aggr', default='max', type=str)
+    parser.add_argument('--mask_mha', action='store_true',
+                        help='Enable 2-head MHA in MaskNet (ignored for jointnet arch)')
+    parser.add_argument('--mha_heads', default=2, type=int,
+                        help='Number of MHA heads when --mask_mha is set (default: 2)')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
     ######################
     parser.add_argument('--train_batch', default=2, type=int, metavar='N', help='train batchsize')
     parser.add_argument('--test_batch', default=2, type=int, metavar='N', help='test batchsize')

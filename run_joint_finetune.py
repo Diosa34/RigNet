@@ -12,8 +12,9 @@ import os
 import numpy as np
 import shutil
 import argparse
+import time
 
-from utils.log_utils import AverageMeter
+from utils.log_utils import AverageMeter, load_state_dict_compat, count_mha_params, setup_device
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
@@ -25,15 +26,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 from models.GCN import JOINTNET_MASKNET_MEANSHIFT
 from datasets.skeleton_dataset import GraphDataset
-from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average
+from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average, compute_precision_recall
+
+from scipy.spatial.distance import cdist
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 import mlflow
 import mlflow.pytorch
 
 
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    torch.cuda.set_device(device)
+device = None
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -82,6 +84,8 @@ def meanshift_cluster(pts, bandwidth, weights, args):
 
 def main(args):
     global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -94,8 +98,13 @@ def main(args):
         mkdir_p(args.logdir)
 
     # create model
-    model = JOINTNET_MASKNET_MEANSHIFT()
+    model = JOINTNET_MASKNET_MEANSHIFT(mask_mha=args.mask_mha, mha_heads=args.mha_heads)
     model.to(device)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    mha_params = count_mha_params(model.masknet)
+    print('    Total trainable params: %.2fM (%d)' % (total_params / 1e6, total_params))
+    if args.mask_mha:
+        print('    Additional MHA params (MaskNet): %d (%.4fM)' % (mha_params, mha_params / 1e6))
 
     optimizer = torch.optim.Adam([{'params': model.jointnet.parameters(), 'lr': args.jointnet_lr},
                                   {'params': model.masknet.parameters(), 'lr': args.masknet_lr},
@@ -106,28 +115,33 @@ def main(args):
     if args.resume:
         if isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(args.resume, map_location=device)
             args.start_epoch = checkpoint['epoch']
             lowest_loss = checkpoint['lowest_loss']
-            model.load_state_dict(checkpoint['state_dict'])
+            load_state_dict_compat(model, checkpoint['state_dict'], prefix='resume')
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
     else:
-        pretrained_masknet = torch.load(args.masknet_resume)
-        pretrained_jointnet = torch.load(args.jointnet_resume)
-        model.masknet.load_state_dict(pretrained_masknet['state_dict'])
-        model.jointnet.load_state_dict(pretrained_jointnet['state_dict'])
+        pretrained_masknet = torch.load(args.masknet_resume, map_location=device)
+        pretrained_jointnet = torch.load(args.jointnet_resume, map_location=device)
+        load_state_dict_compat(model.masknet, pretrained_masknet['state_dict'], prefix='masknet_pretrained')
+        load_state_dict_compat(model.jointnet, pretrained_jointnet['state_dict'], prefix='jointnet_pretrained')
 
     cudnn.benchmark = True
-    print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
     train_loader = DataLoader(GraphDataset(root=args.train_folder), batch_size=args.train_batch, shuffle=True, follow_batch=['joints'])
     val_loader = DataLoader(GraphDataset(root=args.val_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     test_loader = DataLoader(GraphDataset(root=args.test_folder), batch_size=args.test_batch, shuffle=False, follow_batch=['joints'])
     if args.evaluate:
         print('\nEvaluation only')
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.time()
         test_loss, test_metrics = test(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        test_metrics['inference_time_sec'] = time.time() - t0
         print('test_loss {:.8f}'.format(test_loss))
         print('MeanShift metrics:')
         for k, v in test_metrics.items():
@@ -141,10 +155,19 @@ def main(args):
     with mlflow.start_run(run_name=f"joint_finetune_{args.checkpoint.split('/')[-1]}"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
+        mlflow.log_param("total_trainable_params", total_params)
+        mlflow.log_param("mha_params", mha_params)
+        mlflow.log_param("mask_mha", args.mask_mha)
 
         for epoch in range(args.start_epoch, args.epochs):
             print('\nEpoch: %d ' % (epoch + 1))
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+            epoch_start = time.time()
             train_loss = train(train_loader, model, optimizer, args)
+            epoch_time = time.time() - epoch_start
+            peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+            print('Epoch{:d}. train_time: {:.2f}s, peak_gpu_mem: {:.1f} MB'.format(epoch + 1, epoch_time, peak_mem_mb))
             val_loss, val_metrics = test(val_loader, model, args)
             test_loss, test_metrics = test(test_loader, model, args)
             scheduler.step()
@@ -161,6 +184,8 @@ def main(args):
 
             # log scalar losses
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+            mlflow.log_metric("train_epoch_time_sec", epoch_time, step=epoch + 1)
+            mlflow.log_metric("peak_gpu_mem_mb", peak_mem_mb, step=epoch + 1)
             mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
             mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
             mlflow.log_metric("lr_jointnet", optimizer.param_groups[0]['lr'], step=epoch + 1)
@@ -188,9 +213,9 @@ def main(args):
 
         best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading checkpoint '{}'".format(best_model_path))
-        checkpoint = torch.load(best_model_path)
+        checkpoint = torch.load(best_model_path, map_location=device)
         best_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
+        load_state_dict_compat(model, checkpoint['state_dict'], prefix='best')
         print("=> loaded checkpoint '{}' (epoch {})".format(best_model_path, best_epoch))
         test_loss, test_metrics = test(test_loader, model, args, save_result=True, best_epoch=best_epoch)
         print('Best epoch:\n test_loss {:.8f}'.format(test_loss))
@@ -248,6 +273,17 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
     avg_shift_last_meter = AverageMeter()
     total_disp_meter = AverageMeter()
     disp_std_meter = AverageMeter()
+    # joint metrics after mean-shift clustering
+    joint_mean_error_meter = AverageMeter()
+    joint_median_error_meter = AverageMeter()
+    joint_precision_meter = AverageMeter()
+    joint_recall_meter = AverageMeter()
+    joint_f1_meter = AverageMeter()
+    pred_joint_count_meter = AverageMeter()
+    gt_joint_count_meter = AverageMeter()
+    # mask metrics (when BCE supervision is enabled)
+    all_mask_probs = []
+    all_mask_labels = []
 
     outdir = args.checkpoint.split('/')[-1]
     for data in test_loader:
@@ -272,6 +308,24 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
                 # chamfer after mean shift
                 cd_after = chamfer_distance_with_average(y_pred_final.unsqueeze(0), joint_gt.unsqueeze(0))
                 cd_after_meter.update(cd_after.item())
+
+                # joint position metrics after clustering (Hungarian matching)
+                gt_np = joint_gt.detach().cpu().numpy()
+                pred_np = y_pred_final.detach().cpu().numpy()
+                dist_matrix = cdist(gt_np, pred_np)
+                min_gt_to_pred = dist_matrix.min(axis=1)
+                joint_mean_error_meter.update(min_gt_to_pred.mean())
+                joint_median_error_meter.update(np.median(min_gt_to_pred))
+
+                scale = np.mean(np.linalg.norm(gt_np, axis=1))
+                tolerance = 0.05 * scale if scale > 0 else 0.01
+                precision, recall = compute_precision_recall(pred_np, gt_np, tolerance)
+                joint_precision_meter.update(precision)
+                joint_recall_meter.update(recall)
+                f1 = 2 * precision * recall / (precision + recall + 1e-10)
+                joint_f1_meter.update(f1)
+                pred_joint_count_meter.update(len(pred_np))
+                gt_joint_count_meter.update(len(gt_np))
 
                 # mean shift dynamics metrics
                 # 1. avg_shift_last: average norm of displacement between last two steps
@@ -313,6 +367,8 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
             if args.use_bce:
                 mask_gt = data.mask.unsqueeze(1)
                 loss_total += args.bce_loss_weight * torch.nn.functional.binary_cross_entropy_with_logits(mask_pred_nosigmoid, mask_gt.float(), reduction='mean')
+                all_mask_probs.append(torch.sigmoid(mask_pred_nosigmoid).detach().cpu().numpy().reshape(-1))
+                all_mask_labels.append(mask_gt.detach().cpu().numpy().reshape(-1))
             loss_meter.update(loss_total.item())
 
     metrics = {
@@ -320,7 +376,21 @@ def test(test_loader, model, args, save_result=False, best_epoch=None):
         'avg_shift_last': avg_shift_last_meter.avg,
         'total_disp': total_disp_meter.avg,
         'disp_std': disp_std_meter.avg,
+        'mean_joint_error': joint_mean_error_meter.avg,
+        'median_joint_error': joint_median_error_meter.avg,
+        'joint_precision': joint_precision_meter.avg,
+        'joint_recall': joint_recall_meter.avg,
+        'joint_f1': joint_f1_meter.avg,
+        'pred_joint_count': pred_joint_count_meter.avg,
+        'gt_joint_count': gt_joint_count_meter.avg,
     }
+    if all_mask_probs:
+        all_mask_probs = np.concatenate(all_mask_probs)
+        all_mask_labels = np.concatenate(all_mask_labels)
+        pred_bin = (all_mask_probs > 0.5).astype(np.uint8)
+        metrics['mask_precision'] = precision_score(all_mask_labels, pred_bin, zero_division=0)
+        metrics['mask_recall'] = recall_score(all_mask_labels, pred_bin, zero_division=0)
+        metrics['mask_f1'] = f1_score(all_mask_labels, pred_bin, zero_division=0)
     return loss_meter.avg, metrics
 
 
@@ -352,6 +422,12 @@ if __name__ == '__main__':
     parser.add_argument('--ms_loss_weight', default=2.0, type=float)  # weight for chamfer loss after meanshift
     parser.add_argument('--use_bce', action='store_true')  # if using mask supervision during finetuning
     parser.add_argument('--bce_loss_weight', default=0.1, type=float)  # weight for bce loss
+    parser.add_argument('--mask_mha', action='store_true',
+                        help='Enable 2-head MHA in MaskNet only (JointNet unchanged)')
+    parser.add_argument('--mha_heads', default=2, type=int,
+                        help='Number of MHA heads when --mask_mha is set (default: 2)')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
 
     print(parser.parse_args())
     main(parser.parse_args())

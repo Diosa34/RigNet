@@ -12,7 +12,7 @@ import shutil
 import argparse
 import numpy as np
 
-from utils.log_utils import AverageMeter
+from utils.log_utils import AverageMeter, setup_device
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_rigging
 from utils.log_args_to_mlflow import log_args_to_mlflow
@@ -30,7 +30,7 @@ import mlflow
 import mlflow.pytorch
 import matplotlib.pyplot as plt
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = None
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -117,6 +117,8 @@ def grid_search_threshold(val_loader, model, args, thresholds=None):
 
 def main(args):
     global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -450,5 +452,7 @@ if __name__ == '__main__':
     parser.add_argument('--threshold', default=1e-4, type=float, help='threshold for active bones in precision/recall')
     # Grid search flag
     parser.add_argument('--grid_search', action='store_true', help='run grid search over thresholds to optimize F1 on validation set')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
     print(parser.parse_args())
     main(parser.parse_args())

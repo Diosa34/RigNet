@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 from models.PairCls_GCN import PairCls
 from datasets.skeleton_dataset import GraphDataset
 from utils.os_utils import isdir, mkdir_p, isfile
-from utils.log_utils import AverageMeter
+from utils.log_utils import AverageMeter, setup_device
 from utils.log_args_to_mlflow import log_args_to_mlflow
 
 import mlflow
@@ -35,7 +35,7 @@ from sklearn.metrics import (
     roc_auc_score
 )
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = None
 
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar', snapshot=None):
@@ -51,6 +51,8 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 
 def main(args):
     global device
+    device = setup_device(args.gpu)
+    print('Using device: %s' % device)
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -259,5 +261,7 @@ if __name__ == '__main__':
                         type=str, help='folder of testing data')
     
     parser.add_argument('--topk', default=0.3, type=float, help='topk ratio for ohem')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='CUDA device index, e.g. 0 for cuda:0, 2 for cuda:2 (default: 0)')
     print(parser.parse_args())
     main(parser.parse_args())
