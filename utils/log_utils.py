@@ -7,6 +7,7 @@
 #-------------------------------------------------------------------------------
 
 import torch
+import mlflow
 
 
 class AverageMeter(object):
