@@ -7,8 +7,11 @@
 #-------------------------------------------------------------------------------
 import torch
 from models.gcn_basic_modules import MLP, GCU
+from models.iterative_mask_refinement import IterativeMaskRefinement
 from torch_scatter import scatter_max, scatter_mean
 from torch.nn import Sequential, Dropout, Linear, ReLU, Parameter
+
+H_DIM = 64 + 256 + 512  # persistent per-vertex features from GCU stack
 
 
 class JointPredNet(torch.nn.Module):
@@ -31,12 +34,12 @@ class JointPredNet(torch.nn.Module):
             torch.nn.init.zeros_(self.mlp_tramsform[2].weight)
             torch.nn.init.zeros_(self.mlp_tramsform[2].bias)
 
-    def forward(self, data):
+    def _encode(self, data):
         if self.input_normal:
             x = torch.cat([data.pos, data.x], dim=1)
         else:
             x = data.pos
-        geo_edge_index, tpl_edge_index, batch = data.geo_edge_index, data.tpl_edge_index, data.batch
+        geo_edge_index, tpl_edge_index = data.geo_edge_index, data.tpl_edge_index
 
         x_1 = self.gcu_1(x, tpl_edge_index, geo_edge_index)
         x_2 = self.gcu_2(x_1, tpl_edge_index, geo_edge_index)
@@ -44,27 +47,99 @@ class JointPredNet(torch.nn.Module):
         x_4 = self.mlp_glb(torch.cat([x_1, x_2, x_3], dim=1))
 
         x_global, _ = scatter_max(x_4, data.batch, dim=0)
-        #x_global_mean = scatter_mean(x_4, data.batch, dim=0)
-        #x_global = torch.cat([x_global_max, x_global_mean], dim=1)
         x_global = torch.repeat_interleave(x_global, torch.bincount(data.batch), dim=0)
 
-        x_5 = torch.cat([x_global, x, x_1, x_2, x_3], dim=1)
+        h = torch.cat([x_1, x_2, x_3], dim=1)
+        return {
+            "h": h,
+            "x": x,
+            "x_1": x_1,
+            "x_2": x_2,
+            "x_3": x_3,
+            "x_global": x_global,
+        }
+
+    def encode(self, data):
+        """Return persistent per-vertex GCU features and context."""
+        return self._encode(data)
+
+    def decode(self, encoded):
+        """Map encoded features to output logits/displacements."""
+        x_5 = torch.cat(
+            [encoded["x_global"], encoded["x"], encoded["x_1"], encoded["x_2"], encoded["x_3"]],
+            dim=1,
+        )
         out = self.mlp_tramsform(x_5)
         if self.arch == 'jointnet':
             out = torch.tanh(out)
         return out
 
+    def forward(self, data):
+        encoded = self._encode(data)
+        return self.decode(encoded)
+
 
 class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
-    def __init__(self):
+    """
+    JointNet (once) -> MaskNet initial logits -> IterativeMaskRefinement -> mean-shift attention.
+
+    Pipeline per forward pass:
+      1. JointNet predicts displacement (fixed for all refinement steps).
+      2. MaskNet backbone produces h and initial mask logits.
+      3. IterativeMaskRefinement updates logits via residual deltas.
+      4. Final sigmoid(attention) is consumed by the existing mean-shift routine.
+    """
+
+    def __init__(
+        self,
+        num_refine_steps=2,
+        num_experts=1,
+        shared_refinement=True,
+        refine_hidden_dim=256,
+        gating_hidden_dim=128,
+    ):
         super(JOINTNET_MASKNET_MEANSHIFT, self).__init__()
         self.jointnet = JointPredNet(3, input_normal=False, arch='jointnet', aggr='max')
         self.masknet = JointPredNet(1, input_normal=False, arch='masknet', aggr='max')
         self.bandwidth = Parameter(torch.Tensor(1))
         self.bandwidth.data.fill_(0.04)
 
-    def forward(self, data):
+        self.num_refine_steps = num_refine_steps
+        self.num_experts = num_experts
+        self.shared_refinement = shared_refinement
+
+        self.refinement = IterativeMaskRefinement(
+            h_dim=H_DIM,
+            num_refine_steps=num_refine_steps,
+            num_experts=num_experts,
+            shared_refinement=shared_refinement,
+            refine_hidden_dim=refine_hidden_dim,
+            gating_hidden_dim=gating_hidden_dim,
+        )
+
+    def forward(self, data, return_refinement=False):
+        # JointNet runs once; displacement is reused at every refinement step.
         x_offset = self.jointnet(data)
-        x_mask_prob_0 = self.masknet(data)
-        x_mask_prob = torch.sigmoid(x_mask_prob_0)
-        return x_offset, x_mask_prob_0, x_mask_prob, self.bandwidth
+
+        encoded = self.masknet.encode(data)
+        h = encoded["h"]
+        logits_0 = self.masknet.decode(encoded)
+
+        refine_out = self.refinement(h, x_offset, logits_0, data.batch)
+        mask_logits = refine_out["logits_steps"][-1]
+        mask_prob = torch.sigmoid(mask_logits)
+
+        if return_refinement:
+            return {
+                "x_offset": x_offset,
+                "mask_logits": mask_logits,
+                "mask_prob": mask_prob,
+                "bandwidth": self.bandwidth,
+                "logits_steps": refine_out["logits_steps"],
+                "attention_steps": refine_out["attention_steps"],
+                "delta_logits_steps": refine_out["delta_logits_steps"],
+                "gate_entropy_steps": refine_out["gate_entropy_steps"],
+                "h": h,
+            }
+
+        return x_offset, mask_logits, mask_prob, self.bandwidth
