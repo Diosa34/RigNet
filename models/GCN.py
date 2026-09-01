@@ -116,18 +116,31 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
             refine_hidden_dim=refine_hidden_dim,
             gating_hidden_dim=gating_hidden_dim,
         )
+        self._jointnet_frozen = False
+
+    def freeze_jointnet(self):
+        """Freeze JointNet so training measures only MaskNet / refinement effect."""
+        for param in self.jointnet.parameters():
+            param.requires_grad = False
+        self.jointnet.eval()
+        self._jointnet_frozen = True
 
     def forward(self, data, return_refinement=False):
-        # JointNet runs once; displacement is reused at every refinement step.
-        x_offset = self.jointnet(data)
+        if self._jointnet_frozen:
+            with torch.no_grad():
+                x_offset = self.jointnet(data)
+            x_offset = x_offset.detach()
+        else:
+            x_offset = self.jointnet(data)
 
         encoded = self.masknet.encode(data)
         h = encoded["h"]
         logits_0 = self.masknet.decode(encoded)
 
-        refine_out = self.refinement(h, x_offset, logits_0, data.batch)
+        refine_out = self.refinement(h, data.pos, x_offset, logits_0, data.batch)
         mask_logits = refine_out["logits_steps"][-1]
         mask_prob = torch.sigmoid(mask_logits)
+        q_final = refine_out["q_steps"][-1]
 
         if return_refinement:
             return {
@@ -137,9 +150,13 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
                 "bandwidth": self.bandwidth,
                 "logits_steps": refine_out["logits_steps"],
                 "attention_steps": refine_out["attention_steps"],
+                "displacement_steps": refine_out["displacement_steps"],
+                "q_steps": refine_out["q_steps"],
                 "delta_logits_steps": refine_out["delta_logits_steps"],
                 "gate_entropy_steps": refine_out["gate_entropy_steps"],
+                "prob_shift_steps": refine_out["prob_shift_steps"],
                 "h": h,
+                "q_final": q_final,
             }
 
         return x_offset, mask_logits, mask_prob, self.bandwidth

@@ -1,6 +1,7 @@
 #-------------------------------------------------------------------------------
 # Iterative mask / attention refinement with optional Mixture-of-Recursion (MoR).
 # Updates logits via residual deltas: logits_{t+1} = logits_t + Δlogits_t.
+# Each step explicitly forms q_t = pos + displacement_t and passes q_t - pos.
 #-------------------------------------------------------------------------------
 import torch
 from torch.nn import Module, ModuleList, Sequential, Linear, ReLU
@@ -38,8 +39,19 @@ def _assert_vertex_consistent(*tensors):
         assert t.shape[0] == n, "all per-vertex tensors must share the same vertex count"
 
 
+def _assert_q_t(q_t, pos, displacement_t):
+    """Validate geometric hypothesis q_t = pos + displacement_t."""
+    _assert_vertex_consistent(q_t, pos, displacement_t)
+    assert q_t.shape[1] == 3 and pos.shape[1] == 3 and displacement_t.shape[1] == 3
+    _assert_finite("q_t", q_t)
+    expected = pos + displacement_t
+    assert torch.allclose(q_t, expected, atol=1e-5, rtol=1e-5), (
+        "q_t must equal pos + displacement_t"
+    )
+
+
 class RefinementExpert(Module):
-    """Lightweight per-vertex expert: [h, displacement, attention] -> Δlogits."""
+    """Lightweight per-vertex expert: [h, q_t - pos, attention] -> Δlogits."""
 
     def __init__(self, h_dim, hidden_dim):
         super().__init__()
@@ -52,8 +64,8 @@ class RefinementExpert(Module):
             Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, h, displacement, attention):
-        x = torch.cat([h, displacement, attention], dim=1)
+    def forward(self, h, rel_displacement, attention):
+        x = torch.cat([h, rel_displacement, attention], dim=1)
         return self.mlp(x)
 
 
@@ -70,9 +82,9 @@ class GatingNetwork(Module):
         )
         self.num_experts = num_experts
 
-    def forward(self, h, displacement, attention, batch):
+    def forward(self, h, rel_displacement, attention, batch):
         _assert_batch_offsets(batch, h.shape[0])
-        x = torch.cat([h, displacement, attention], dim=1)
+        x = torch.cat([h, rel_displacement, attention], dim=1)
         gate_logits = self.mlp(x)
         assert gate_logits.shape == (h.shape[0], self.num_experts)
         return torch.softmax(gate_logits, dim=1)
@@ -82,8 +94,9 @@ class IterativeMaskRefinement(Module):
     """
     Iteratively refines mask logits after the initial MaskNet prediction.
 
-    JointNet displacement is fixed across steps (q_t = pos + displacement).
-    Persistent vertex features h are reused at every step.
+    At each step t the geometric hypothesis is q_t = pos + displacement_t.
+    Experts receive [h, q_t - pos, attention_t].  For attention-only refinement
+    displacement_t stays equal to the initial JointNet displacement.
     """
 
     def __init__(
@@ -128,55 +141,79 @@ class IterativeMaskRefinement(Module):
             return self.experts, self.gating
         return self.step_experts[step_idx], self.step_gatings[step_idx]
 
-    def _compute_delta_logits(self, experts, gating, h, displacement, attention, batch):
-        delta_per_expert = [expert(h, displacement, attention) for expert in experts]
+    def _compute_delta_logits(self, experts, gating, h, rel_displacement, attention, batch):
+        delta_per_expert = [expert(h, rel_displacement, attention) for expert in experts]
         for delta in delta_per_expert:
             assert delta.shape == (h.shape[0], 1)
 
         if self.num_experts == 1:
             return delta_per_expert[0], None
 
-        gate_weights = gating(h, displacement, attention, batch)
+        gate_weights = gating(h, rel_displacement, attention, batch)
         delta_stack = torch.stack(delta_per_expert, dim=1)
         assert delta_stack.shape == (h.shape[0], self.num_experts, 1)
         delta_logits = (gate_weights.unsqueeze(-1) * delta_stack).sum(dim=1)
         return delta_logits, gate_weights
 
-    def forward(self, h, displacement, logits_0, batch, num_refine_steps=None):
+    def forward(self, h, pos, displacement_0, logits_0, batch, num_refine_steps=None):
         steps = num_refine_steps if num_refine_steps is not None else self.num_refine_steps
         assert steps >= 1
 
-        _assert_vertex_consistent(h, displacement, logits_0)
+        _assert_vertex_consistent(h, pos, displacement_0, logits_0)
         assert h.shape[1] == self.h_dim, f"h dim {h.shape[1]} != expected {self.h_dim}"
-        assert displacement.shape[1] == 3
+        assert pos.shape[1] == 3 and displacement_0.shape[1] == 3
         assert logits_0.shape[1] == 1
         _assert_batch_offsets(batch, h.shape[0])
         _assert_finite("h", h)
-        _assert_finite("displacement", displacement)
+        _assert_finite("pos", pos)
+        _assert_finite("displacement_0", displacement_0)
         _assert_finite("logits_0", logits_0)
+
+        q_0 = pos + displacement_0
+        _assert_q_t(q_0, pos, displacement_0)
 
         logits_steps = [logits_0]
         attention_steps = [torch.sigmoid(logits_0)]
+        displacement_steps = [displacement_0]
+        q_steps = [q_0]
         delta_logits_steps = []
         gate_entropy_steps = []
+        prob_shift_steps = []
 
         for t in range(steps):
             logits_t = logits_steps[-1]
             attention_t = attention_steps[-1]
-            experts, gating = self._modules_for_step(t)
+            displacement_t = displacement_steps[-1]
+            q_t = pos + displacement_t
+            _assert_q_t(q_t, pos, displacement_t)
 
+            rel_displacement = q_t - pos
+            assert rel_displacement.shape == displacement_t.shape
+            _assert_finite(f"rel_displacement_step_{t}", rel_displacement)
+
+            experts, gating = self._modules_for_step(t)
             delta_logits_t, gate_weights = self._compute_delta_logits(
-                experts, gating, h, displacement, attention_t, batch
+                experts, gating, h, rel_displacement, attention_t, batch
             )
             _assert_finite(f"delta_logits_step_{t}", delta_logits_t)
 
             logits_next = logits_t + delta_logits_t
+            attention_next = torch.sigmoid(logits_next)
             _assert_finite(f"logits_step_{t + 1}", logits_next)
-            _assert_vertex_consistent(logits_next, logits_t, attention_t)
+            _assert_vertex_consistent(logits_next, logits_t, attention_t, q_t)
+
+            prob_shift_steps.append((attention_next - attention_t).abs().mean())
 
             logits_steps.append(logits_next)
-            attention_steps.append(torch.sigmoid(logits_next))
+            attention_steps.append(attention_next)
             delta_logits_steps.append(delta_logits_t)
+
+            # Attention-only refinement: displacement stays fixed; q_t recomputed explicitly.
+            displacement_next = displacement_0
+            q_next = pos + displacement_next
+            _assert_q_t(q_next, pos, displacement_next)
+            displacement_steps.append(displacement_next)
+            q_steps.append(q_next)
 
             if gate_weights is not None:
                 entropy = -(gate_weights * torch.log(gate_weights + 1e-10)).sum(dim=1).mean()
@@ -185,6 +222,9 @@ class IterativeMaskRefinement(Module):
         return {
             "logits_steps": logits_steps,
             "attention_steps": attention_steps,
+            "displacement_steps": displacement_steps,
+            "q_steps": q_steps,
             "delta_logits_steps": delta_logits_steps,
             "gate_entropy_steps": gate_entropy_steps,
+            "prob_shift_steps": prob_shift_steps,
         }
