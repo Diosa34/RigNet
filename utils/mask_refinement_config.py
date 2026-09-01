@@ -48,7 +48,8 @@ def add_refinement_args(parser):
         dest="num_experts",
         default=1,
         type=int,
-        help="Number of MoR refinement experts (1 = no mixture gating)",
+        choices=[1, 2, 3],
+        help="Number of MoR refinement experts (1 = single shared expert, no gating)",
     )
     parser.add_argument(
         "--shared-refinement",
@@ -91,6 +92,26 @@ def add_refinement_args(parser):
         type=float,
         help="Learning rate for IterativeMaskRefinement parameters",
     )
+    parser.add_argument(
+        "--seed",
+        default=42,
+        type=int,
+        help="Random seed for reproducibility",
+    )
+
+
+def log_experiment_config(args):
+    """Log core experiment configuration as MLflow params."""
+    import mlflow
+    for key in (
+        "ablation", "num_refine_steps", "num_experts", "shared_refinement",
+        "lambda_intermediate", "refine_hidden_dim", "gating_hidden_dim",
+        "refine_lr", "masknet_lr", "bandwidth_lr", "bce_loss_weight",
+        "ms_loss_weight", "seed", "epochs", "use_bce",
+    ):
+        if hasattr(args, key):
+            mlflow.log_param(key, getattr(args, key))
+    mlflow.log_param("jointnet_frozen", True)
 
 
 def apply_ablation_preset(args):

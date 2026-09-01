@@ -119,11 +119,18 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
         self._jointnet_frozen = False
 
     def freeze_jointnet(self):
-        """Freeze JointNet so training measures only MaskNet / refinement effect."""
+        """Freeze JointNet: no gradients, eval mode, detached forward."""
         for param in self.jointnet.parameters():
             param.requires_grad = False
         self.jointnet.eval()
         self._jointnet_frozen = True
+
+    def verify_jointnet_frozen(self):
+        """Sanity check that JointNet cannot receive optimizer updates."""
+        assert self._jointnet_frozen, "JointNet must be frozen for iterative refinement experiment"
+        for name, param in self.jointnet.named_parameters():
+            assert not param.requires_grad, f"JointNet param {name} still requires grad"
+        assert not any(p.requires_grad for p in self.jointnet.parameters())
 
     def forward(self, data, return_refinement=False):
         if self._jointnet_frozen:
