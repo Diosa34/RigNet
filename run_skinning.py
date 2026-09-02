@@ -117,6 +117,11 @@ def grid_search_threshold(val_loader, model, args, thresholds=None):
 
 def main(args):
     global device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     lowest_loss = 1e20
 
     # create checkpoint dir and log dir
@@ -450,5 +455,7 @@ if __name__ == '__main__':
     parser.add_argument('--threshold', default=1e-4, type=float, help='threshold for active bones in precision/recall')
     # Grid search flag
     parser.add_argument('--grid_search', action='store_true', help='run grid search over thresholds to optimize F1 on validation set')
-    print(parser.parse_args())
-    main(parser.parse_args())
+    parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
+    args = parser.parse_args()
+    print(args)
+    main(args)

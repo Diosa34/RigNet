@@ -215,6 +215,11 @@ def joint_meanshift_loss(q_pred, mask_prob, bandwidth, joint_gt, args):
 
 def main(args):
     global device
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
     args = apply_ablation_preset(args)
     set_seed(getattr(args, 'seed', 42))
 
@@ -545,6 +550,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', default=42, type=int)
 
     add_refinement_args(parser)
+    parser.add_argument('--cuda', default=0, type=int, help='CUDA device index')
     args = parser.parse_args()
     print(args)
     main(args)
