@@ -16,6 +16,7 @@ from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
 from utils.mask_refinement_config import add_refinement_args, apply_ablation_preset, SHARED_REFINEMENT
+from utils.mlflow_metrics import BestTracker, log_mask_f1_steps, log_gate_entropy_steps, compute_gate_entropy_mean
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -34,9 +35,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, average_pre
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 REFINE_LR = 5e-5
-
-VAL_BEST_MIN = {"loss", "cd_after", "avg_shift_last", "total_disp", "disp_std"}
-VAL_BEST_MAX = {"mask_f1_improvement", "refine_delta_logit_mean", "mask_prob_shift_mean"}
+MEANSHIFT_METRICS = ("cd_after", "avg_shift_last", "total_disp", "disp_std")
+REFINEMENT_METRICS = ("mask_f1_improvement", "refine_delta_logit_mean", "mask_prob_shift_mean")
 
 
 def set_seed(seed):
@@ -170,13 +170,16 @@ def average_step_metrics(accumulator):
     return avg
 
 
-def compute_refinement_diagnostics(step_metrics):
+def compute_refinement_diagnostics(step_metrics, num_experts=1):
     if not step_metrics or not step_metrics.get("per_step"):
-        return {
+        diag = {
             "mask_f1_improvement": 0.0,
             "refine_delta_logit_mean": 0.0,
             "mask_prob_shift_mean": 0.0,
         }
+        if num_experts > 1:
+            diag["gate_entropy"] = 0.0
+        return diag
     f1_steps = [step_metrics["per_step"][t]["mask_f1"] for t in sorted(step_metrics["per_step"])]
     diag = {"mask_f1_improvement": f1_steps[-1] - f1_steps[0]}
     transitions = step_metrics.get("per_transition", {})
@@ -190,22 +193,9 @@ def compute_refinement_diagnostics(step_metrics):
     else:
         diag["refine_delta_logit_mean"] = 0.0
         diag["mask_prob_shift_mean"] = 0.0
+    if num_experts > 1:
+        diag["gate_entropy"] = compute_gate_entropy_mean(step_metrics)
     return diag
-
-
-def log_step_metrics_to_mlflow(prefix, step_metrics, epoch, num_experts):
-    for t, sm in step_metrics["per_step"].items():
-        mlflow.log_metric(f"{prefix}_mask_loss_step{t}", sm["mask_loss"], step=epoch)
-        mlflow.log_metric(f"{prefix}_mask_precision_step{t}", sm["mask_precision"], step=epoch)
-        mlflow.log_metric(f"{prefix}_mask_recall_step{t}", sm["mask_recall"], step=epoch)
-        mlflow.log_metric(f"{prefix}_mask_f1_step{t}", sm["mask_f1"], step=epoch)
-        mlflow.log_metric(f"{prefix}_mask_pr_auc_step{t}", sm["mask_pr_auc"], step=epoch)
-
-    for t, tr in step_metrics["per_transition"].items():
-        mlflow.log_metric(f"{prefix}_refine_delta_logit_mean_step{t}", tr["refine_delta_logit_mean"], step=epoch)
-        mlflow.log_metric(f"{prefix}_mask_prob_shift_mean_step{t}", tr["mask_prob_shift_mean"], step=epoch)
-        if num_experts > 1 and "gate_entropy" in tr:
-            mlflow.log_metric(f"{prefix}_gate_entropy_step{t}", tr["gate_entropy"], step=epoch)
 
 
 def forward_model(model, data):
@@ -229,7 +219,10 @@ def main(args):
     set_seed(getattr(args, 'seed', 42))
 
     lowest_val_loss = 1e20
-    best_tracker = {"val": {}, "val_epochs": {}}
+    best_tracker = BestTracker(
+        lower_better={"loss"} | set(MEANSHIFT_METRICS),
+        higher_better=set(REFINEMENT_METRICS),
+    )
 
     if not isdir(args.checkpoint):
         print("Create new checkpoint folder " + args.checkpoint)
@@ -256,7 +249,12 @@ def main(args):
         args.start_epoch = checkpoint['epoch']
         lowest_val_loss = checkpoint['lowest_loss']
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        best_tracker = checkpoint.get('best_tracker', best_tracker)
+        best_tracker = checkpoint.get('best_tracker')
+        if not isinstance(best_tracker, BestTracker):
+            best_tracker = BestTracker(
+                lower_better={"loss"} | set(MEANSHIFT_METRICS),
+                higher_better=set(REFINEMENT_METRICS),
+            )
         try:
             optimizer.load_state_dict(checkpoint['optimizer'])
         except ValueError:
@@ -308,33 +306,41 @@ def main(args):
             print('\nEpoch: %d' % (epoch + 1))
             train_loss, train_metrics, train_steps = train_epoch(train_loader, model, optimizer, args)
             val_loss, val_metrics, val_steps = evaluate(val_loader, model, args)
+            test_loss, test_metrics, test_steps = evaluate(test_loader, model, args)
             scheduler.step()
 
-            print('Epoch{:d}. train_loss: {:.6f}. val_loss: {:.6f}.'.format(epoch + 1, train_loss, val_loss))
+            print('Epoch{:d}. train_loss: {:.6f}. val_loss: {:.6f}. test_loss: {:.6f}.'.format(
+                epoch + 1, train_loss, val_loss, test_loss))
 
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
             mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
+            mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
+            mlflow.log_metric("lr_jointnet", 0.0, step=epoch + 1)  # frozen
             mlflow.log_metric("lr_masknet", optimizer.param_groups[0]['lr'], step=epoch + 1)
-            mlflow.log_metric("lr_refinement", optimizer.param_groups[1]['lr'], step=epoch + 1)
             mlflow.log_metric("lr_bandwidth", optimizer.param_groups[2]['lr'], step=epoch + 1)
 
-            for k, v in val_metrics.items():
-                mlflow.log_metric(f"val_{k}", float(v), step=epoch + 1)
-                logger.add_scalar(f"val/{k}", float(v), epoch + 1)
+            for k in MEANSHIFT_METRICS:
+                mlflow.log_metric(f"val_{k}", float(val_metrics[k]), step=epoch + 1)
+                mlflow.log_metric(f"test_{k}", float(test_metrics[k]), step=epoch + 1)
+                logger.add_scalar(f"val/{k}", float(val_metrics[k]), epoch + 1)
+                logger.add_scalar(f"test/{k}", float(test_metrics[k]), epoch + 1)
 
             logger.add_scalar("train/loss", train_loss, epoch + 1)
             logger.add_scalar("val/loss", val_loss, epoch + 1)
+            logger.add_scalar("test/loss", test_loss, epoch + 1)
 
+            # --- iterative / MoR metrics ---
             if args.use_bce:
-                if train_steps:
-                    log_step_metrics_to_mlflow("train", train_steps, epoch + 1, args.num_experts)
-                if val_steps:
-                    log_step_metrics_to_mlflow("val", val_steps, epoch + 1, args.num_experts)
-                for split, metrics in (("train", train_metrics), ("val", val_metrics)):
-                    for key in ("mask_f1_improvement", "refine_delta_logit_mean", "mask_prob_shift_mean"):
+                for split, metrics in (("train", train_metrics), ("val", val_metrics), ("test", test_metrics)):
+                    for key in REFINEMENT_METRICS:
                         mlflow.log_metric(f"{split}_{key}", metrics.get(key, 0.0), step=epoch + 1)
+                    if args.num_experts > 1 and "gate_entropy" in metrics:
+                        mlflow.log_metric(f"{split}_gate_entropy", metrics["gate_entropy"], step=epoch + 1)
+                for prefix, steps in (("train", train_steps), ("val", val_steps), ("test", test_steps)):
+                    log_mask_f1_steps(prefix, steps, epoch + 1)
+                    log_gate_entropy_steps(prefix, steps, epoch + 1, args.num_experts)
 
-            _update_best_tracker(best_tracker, val_metrics, val_loss, epoch + 1)
+            best_tracker.update(val_metrics, val_loss, epoch + 1)
 
             is_best = val_loss < lowest_val_loss
             lowest_val_loss = min(val_loss, lowest_val_loss)
@@ -346,7 +352,8 @@ def main(args):
                 'best_tracker': best_tracker,
             }, is_best, checkpoint=args.checkpoint)
 
-        _log_best_val_summary(best_tracker)
+        mlflow.log_param("best_val_epoch", int(best_tracker.epochs.get("loss", 0)))
+        best_tracker.log_summary("best_val")
 
         best_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading best validation checkpoint '{}'".format(best_path))
@@ -362,45 +369,19 @@ def main(args):
         for k, v in test_metrics.items():
             print('  {}: {:.6f}'.format(k, v))
 
-        mlflow.log_param("best_val_epoch", int(best_epoch))
-        mlflow.log_metric("final_test_loss", test_loss)
-        for k, v in test_metrics.items():
-            mlflow.log_metric(f"final_test_{k}", float(v))
-        if args.use_bce and test_steps:
-            log_step_metrics_to_mlflow("final_test", test_steps, best_epoch, args.num_experts)
-
-
-def _update_best_tracker(tracker, metrics, loss, epoch):
-    store = tracker.setdefault("val", {})
-    epochs = tracker.setdefault("val_epochs", {})
-
-    if "loss" not in store or loss < store["loss"]:
-        store["loss"] = loss
-        epochs["loss"] = epoch
-
-    for key, val in metrics.items():
-        if key in VAL_BEST_MIN:
-            if key not in store or val < store[key]:
-                store[key] = val
-                epochs[key] = epoch
-        elif key in VAL_BEST_MAX:
-            if key not in store or val > store[key]:
-                store[key] = val
-                epochs[key] = epoch
-
-
-def _log_best_val_summary(best_tracker):
-    store = best_tracker.get("val", {})
-    epochs = best_tracker.get("val_epochs", {})
-    mlflow.log_param("best_val_epoch", int(epochs.get("loss", 0)))
-    for key, val in store.items():
-        mlflow.log_metric(f"best_val_{key}", float(val))
-        if key in epochs:
-            mlflow.log_param(f"best_val_{key}_epoch", int(epochs[key]))
+        mlflow.log_metric("test_loss", test_loss)
+        for k in MEANSHIFT_METRICS:
+            mlflow.log_metric(f"test_{k}", float(test_metrics[k]))
+        if args.use_bce:
+            for key in REFINEMENT_METRICS:
+                mlflow.log_metric(f"test_{key}", test_metrics.get(key, 0.0))
+            if args.num_experts > 1 and "gate_entropy" in test_metrics:
+                mlflow.log_metric("test_gate_entropy", test_metrics["gate_entropy"])
+            log_mask_f1_steps("test", test_steps, best_epoch)
+            log_gate_entropy_steps("test", test_steps, best_epoch, args.num_experts)
 
 
 def _mask_bce_loss(logits_steps, mask_gt, args):
-    """L_base contribution from mask: w_final * L_final + lambda * L_intermediate."""
     final_loss, intermediate_loss = compute_mask_bce_split(logits_steps, mask_gt)
     return (
         args.bce_loss_weight * final_loss + args.lambda_intermediate * intermediate_loss,
@@ -453,7 +434,7 @@ def train_epoch(train_loader, model, optimizer, args):
         loss_meter.update(loss_total.item())
 
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
-    metrics = compute_refinement_diagnostics(step_metrics) if args.use_bce else {}
+    metrics = compute_refinement_diagnostics(step_metrics, args.num_experts) if args.use_bce else {}
     return loss_meter.avg, metrics, step_metrics
 
 
@@ -531,7 +512,7 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
     }
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
     if args.use_bce:
-        metrics.update(compute_refinement_diagnostics(step_metrics))
+        metrics.update(compute_refinement_diagnostics(step_metrics, args.num_experts))
 
     return loss_meter.avg, metrics, step_metrics
 

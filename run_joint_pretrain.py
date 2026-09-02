@@ -17,6 +17,7 @@ from utils.log_utils import AverageMeter
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
+from utils.mlflow_metrics import BestTracker
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -104,6 +105,17 @@ def main(args):
     logger = SummaryWriter(log_dir=args.logdir)
 
     mlflow.set_experiment(f"RigNet_{args.arch}_pretrain")
+    if args.arch == 'jointnet':
+        best_tracker = BestTracker(
+            lower_better={"loss", "chamfer", "mean_joint_error"},
+            higher_better={"recall_0.01", "recall_0.025", "recall_0.05"},
+        )
+    else:
+        best_tracker = BestTracker(
+            lower_better={"loss"},
+            higher_better={"precision", "recall", "f1", "pr_auc"},
+        )
+
     with mlflow.start_run(run_name=f"joint_{args.arch}_pretrain"):
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
@@ -135,7 +147,9 @@ def main(args):
                     step=epoch + 1
                 )
             mlflow.log_metric("lr", lr[0], step=epoch + 1)
-            
+
+            best_tracker.update(val_metrics, val_loss, epoch + 1)
+
             # remember best acc and save checkpoint
             is_best = val_loss < lowest_loss
             lowest_loss = min(val_loss, lowest_loss)
@@ -161,6 +175,9 @@ def main(args):
                     float(v),
                     epoch + 1
                 )
+
+        mlflow.log_param("best_val_epoch", int(best_tracker.epochs.get("loss", 0)))
+        best_tracker.log_summary("best_val")
 
         best_model_path = os.path.join(args.checkpoint, 'model_best.pth.tar')
         print("=> loading checkpoint '{}'".format(best_model_path))
