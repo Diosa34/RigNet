@@ -15,7 +15,7 @@ from utils.log_utils import AverageMeter
 from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
-from utils.mask_refinement_config import add_refinement_args, apply_ablation_preset, log_experiment_config
+from utils.mask_refinement_config import add_refinement_args, apply_ablation_preset, SHARED_REFINEMENT
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -33,11 +33,10 @@ from sklearn.metrics import precision_score, recall_score, f1_score, average_pre
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Validation-only best tracking (test never participates in model selection).
-VAL_BEST_MIN = {"loss", "cd_after", "avg_shift_last", "total_disp", "disp_std", "intermediate_mask_loss",
-                "cd_j2j", "cd_j2b", "cd_b2b", "tree_edit_dist"}
-VAL_BEST_MAX = {"mask_precision", "mask_recall", "mask_f1", "mask_pr_auc", "mask_f1_improvement",
-                "skeleton_iou", "skeleton_precision", "skeleton_recall"}
+REFINE_LR = 5e-5
+
+VAL_BEST_MIN = {"loss", "cd_after", "avg_shift_last", "total_disp", "disp_std"}
+VAL_BEST_MAX = {"mask_f1_improvement", "refine_delta_logit_mean", "mask_prob_shift_mean"}
 
 
 def set_seed(seed):
@@ -60,9 +59,9 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 def verify_optimizer_excludes_jointnet(model, optimizer):
     optim_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
     for p in model.jointnet.parameters():
-        assert id(p) not in optim_ids, "JointNet parameters must not be in optimizer"
+        assert id(p) not in optim_ids
     trainable = [p for p in model.parameters() if p.requires_grad]
-    assert all(id(p) in optim_ids for p in trainable), "All trainable params must be in optimizer"
+    assert all(id(p) in optim_ids for p in trainable)
 
 
 def pairwise_distances(x, y):
@@ -74,7 +73,6 @@ def pairwise_distances(x, y):
 
 
 def meanshift_cluster(pts, bandwidth, weights, args):
-    """Existing mean-shift (unchanged)."""
     pts_steps = []
     for _ in range(args.meanshift_step):
         Y = pairwise_distances(pts, pts)
@@ -88,35 +86,49 @@ def meanshift_cluster(pts, bandwidth, weights, args):
     return pts_steps
 
 
-def compute_mask_bce(logits_steps, mask_gt):
-    step_losses = [
-        F.binary_cross_entropy_with_logits(logits, mask_gt.float(), reduction='mean')
-        for logits in logits_steps
-    ]
-    return step_losses, sum(step_losses) / len(step_losses)
+def compute_mask_bce_split(logits_steps, mask_gt):
+    """
+    L_final = BCE(logits_T, mask_gt)
+    L_intermediate = mean(BCE(logits_t, mask_gt) for t in 1..T-1)
+    Step0 (initial MaskNet) and final step T are excluded from L_intermediate.
+    For T=1 (num_refine_steps=1): L_intermediate = 0.
+    """
+    mask_gt = mask_gt.float()
+    T = len(logits_steps) - 1
+    final_loss = F.binary_cross_entropy_with_logits(logits_steps[T], mask_gt, reduction='mean')
+
+    if T <= 1:
+        intermediate_loss = logits_steps[0].new_zeros(())
+    else:
+        intermediate_losses = [
+            F.binary_cross_entropy_with_logits(logits_steps[t], mask_gt, reduction='mean')
+            for t in range(1, T)
+        ]
+        intermediate_loss = sum(intermediate_losses) / len(intermediate_losses)
+
+    return final_loss, intermediate_loss
 
 
-def compute_mask_classification_metrics(all_probs, all_labels):
-    pred_bin = (all_probs > 0.5).astype(np.uint8)
-    labels = all_labels.astype(np.uint8)
+def compute_step_classification(probs, labels):
+    pred_bin = (probs > 0.5).astype(np.uint8)
+    labels = labels.astype(np.uint8)
     return {
         "mask_precision": precision_score(labels, pred_bin, zero_division=0),
         "mask_recall": recall_score(labels, pred_bin, zero_division=0),
         "mask_f1": f1_score(labels, pred_bin, zero_division=0),
-        "mask_pr_auc": average_precision_score(labels, all_probs),
+        "mask_pr_auc": average_precision_score(labels, probs),
     }
 
 
 def collect_step_metrics(logits_steps, delta_logits_steps, prob_shift_steps,
                          gate_entropy_steps, mask_gt, num_experts):
-    """Classification metrics at every intermediate step t=0..T."""
     per_step = {}
     labels = mask_gt.detach().cpu().numpy().reshape(-1).astype(np.uint8)
 
     for t, logits in enumerate(logits_steps):
         probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
         loss_t = F.binary_cross_entropy_with_logits(logits, mask_gt.float(), reduction='mean').item()
-        cls = compute_mask_classification_metrics(probs, labels)
+        cls = compute_step_classification(probs, labels)
         per_step[t] = {
             "mask_loss": loss_t,
             "mask_precision": cls["mask_precision"],
@@ -158,18 +170,23 @@ def average_step_metrics(accumulator):
     return avg
 
 
-def compute_aggregate_diagnostics(step_metrics):
-    """Three required aggregate diagnostics from per-step classification metrics."""
+def compute_refinement_diagnostics(step_metrics):
     if not step_metrics or not step_metrics.get("per_step"):
-        return {"mask_f1_improvement": 0.0, "refine_delta_logit_mean": 0.0, "mask_prob_shift_mean": 0.0}
-
+        return {
+            "mask_f1_improvement": 0.0,
+            "refine_delta_logit_mean": 0.0,
+            "mask_prob_shift_mean": 0.0,
+        }
     f1_steps = [step_metrics["per_step"][t]["mask_f1"] for t in sorted(step_metrics["per_step"])]
     diag = {"mask_f1_improvement": f1_steps[-1] - f1_steps[0]}
-
     transitions = step_metrics.get("per_transition", {})
     if transitions:
-        diag["refine_delta_logit_mean"] = float(np.mean([tr["refine_delta_logit_mean"] for tr in transitions.values()]))
-        diag["mask_prob_shift_mean"] = float(np.mean([tr["mask_prob_shift_mean"] for tr in transitions.values()]))
+        diag["refine_delta_logit_mean"] = float(np.mean(
+            [tr["refine_delta_logit_mean"] for tr in transitions.values()]
+        ))
+        diag["mask_prob_shift_mean"] = float(np.mean(
+            [tr["mask_prob_shift_mean"] for tr in transitions.values()]
+        ))
     else:
         diag["refine_delta_logit_mean"] = 0.0
         diag["mask_prob_shift_mean"] = 0.0
@@ -209,7 +226,7 @@ def joint_meanshift_loss(q_pred, mask_prob, bandwidth, joint_gt, args):
 def main(args):
     global device
     args = apply_ablation_preset(args)
-    set_seed(args.seed)
+    set_seed(getattr(args, 'seed', 42))
 
     lowest_val_loss = 1e20
     best_tracker = {"val": {}, "val_epochs": {}}
@@ -224,14 +241,12 @@ def main(args):
     model = JOINTNET_MASKNET_MEANSHIFT(
         num_refine_steps=args.num_refine_steps,
         num_experts=args.num_experts,
-        shared_refinement=args.shared_refinement,
-        refine_hidden_dim=args.refine_hidden_dim,
-        gating_hidden_dim=args.gating_hidden_dim,
+        shared_refinement=SHARED_REFINEMENT,
     ).to(device)
 
     optimizer = torch.optim.Adam([
         {'params': model.masknet.parameters(), 'lr': args.masknet_lr},
-        {'params': model.refinement.parameters(), 'lr': args.refine_lr},
+        {'params': model.refinement.parameters(), 'lr': REFINE_LR},
         {'params': [model.bandwidth], 'lr': args.bandwidth_lr},
     ], weight_decay=args.weight_decay)
 
@@ -256,10 +271,10 @@ def main(args):
     verify_optimizer_excludes_jointnet(model, optimizer)
 
     cudnn.benchmark = True
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('    Trainable params: %.2fM (JointNet frozen)' % (trainable / 1e6))
-    print('    Refinement: steps=%d experts=%d shared=%s seed=%d' % (
-        args.num_refine_steps, args.num_experts, args.shared_refinement, args.seed))
+    print('    Trainable params: %.2fM (JointNet frozen)' % (
+        sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6))
+    print('    Refinement: steps=%d experts=%d shared=True' % (
+        args.num_refine_steps, args.num_experts))
 
     train_loader = DataLoader(GraphDataset(root=args.train_folder), batch_size=args.train_batch,
                               shuffle=True, follow_batch=['joints'])
@@ -269,8 +284,8 @@ def main(args):
                              shuffle=False, follow_batch=['joints'])
 
     if args.evaluate:
-        _, val_metrics, val_steps = evaluate(val_loader, model, args)
-        _, test_metrics, test_steps = evaluate(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
+        _, val_metrics, _ = evaluate(val_loader, model, args)
+        _, test_metrics, _ = evaluate(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
         print('val:', val_metrics)
         print('test:', test_metrics)
         return
@@ -282,8 +297,12 @@ def main(args):
     mlflow.set_experiment("RigNet_Joint_Finetune")
     with mlflow.start_run(run_name=run_name):
         log_args_to_mlflow(args)
-        log_experiment_config(args)
         mlflow.log_param("device", str(device))
+        mlflow.log_param("jointnet_frozen", True)
+        mlflow.log_param("shared_refinement", True)
+        mlflow.log_param("num_refine_steps", args.num_refine_steps)
+        mlflow.log_param("num_experts", args.num_experts)
+        mlflow.log_param("lambda_intermediate", args.lambda_intermediate)
 
         for epoch in range(args.start_epoch, args.epochs):
             print('\nEpoch: %d' % (epoch + 1))
@@ -307,8 +326,6 @@ def main(args):
             logger.add_scalar("val/loss", val_loss, epoch + 1)
 
             if args.use_bce:
-                mlflow.log_metric("train_intermediate_mask_loss",
-                                  train_metrics.get("intermediate_mask_loss", 0.0), step=epoch + 1)
                 if train_steps:
                     log_step_metrics_to_mlflow("train", train_steps, epoch + 1, args.num_experts)
                 if val_steps:
@@ -373,31 +390,23 @@ def _update_best_tracker(tracker, metrics, loss, epoch):
 
 
 def _log_best_val_summary(best_tracker):
-    """Log best validation metrics only (no best_test_*)."""
     store = best_tracker.get("val", {})
     epochs = best_tracker.get("val_epochs", {})
-
-    best_epoch = epochs.get("loss", 0)
-    mlflow.log_param("best_val_epoch", int(best_epoch))
-
-    mapping = {
-        "loss": "best_val_loss",
-        "mask_precision": "best_val_precision",
-        "mask_recall": "best_val_recall",
-        "mask_f1": "best_val_f1",
-        "mask_pr_auc": "best_val_pr_auc",
-    }
-    for src, dst in mapping.items():
-        if src in store:
-            mlflow.log_metric(dst, float(store[src]))
-            if src in epochs:
-                mlflow.log_param(f"{dst}_epoch", int(epochs[src]))
-
+    mlflow.log_param("best_val_epoch", int(epochs.get("loss", 0)))
     for key, val in store.items():
-        if key not in mapping:
-            mlflow.log_metric(f"best_val_{key}", float(val))
-            if key in epochs:
-                mlflow.log_param(f"best_val_{key}_epoch", int(epochs[key]))
+        mlflow.log_metric(f"best_val_{key}", float(val))
+        if key in epochs:
+            mlflow.log_param(f"best_val_{key}_epoch", int(epochs[key]))
+
+
+def _mask_bce_loss(logits_steps, mask_gt, args):
+    """L_base contribution from mask: w_final * L_final + lambda * L_intermediate."""
+    final_loss, intermediate_loss = compute_mask_bce_split(logits_steps, mask_gt)
+    return (
+        args.bce_loss_weight * final_loss + args.lambda_intermediate * intermediate_loss,
+        final_loss,
+        intermediate_loss,
+    )
 
 
 def train_epoch(train_loader, model, optimizer, args):
@@ -406,7 +415,6 @@ def train_epoch(train_loader, model, optimizer, args):
     model.jointnet.eval()
 
     loss_meter = AverageMeter()
-    intermediate_meter = AverageMeter()
     step_accumulator = {"per_step": {}, "per_transition": {}}
 
     for data in train_loader:
@@ -414,7 +422,7 @@ def train_epoch(train_loader, model, optimizer, args):
         optimizer.zero_grad()
 
         out = forward_model(model, data)
-        q_pred = out["q_final"].detach()  # JointNet frozen: no grad through geometry
+        q_pred = out["q_final"].detach()
         mask_prob = out["mask_prob"]
         bandwidth = out["bandwidth"]
         logits_steps = out["logits_steps"]
@@ -425,16 +433,14 @@ def train_epoch(train_loader, model, optimizer, args):
             joint_gt = data.joints[data.joints_batch == i, :]
             q_i = q_pred[data.batch == i, :]
             mask_i = mask_prob[data.batch == i]
-            _, _, loss_ms, _ = joint_meanshift_loss(q_i, mask_i, bandwidth, joint_gt, args)
-            loss_total += args.ms_loss_weight * loss_ms
+            cd_before, _, loss_ms, _ = joint_meanshift_loss(q_i, mask_i, bandwidth, joint_gt, args)
+            loss_total += cd_before + args.ms_loss_weight * loss_ms
         loss_total /= num_graphs
 
         if args.use_bce:
             mask_gt = data.mask.unsqueeze(1)
-            step_losses, intermediate_loss = compute_mask_bce(logits_steps, mask_gt)
-            loss_total = loss_total + args.bce_loss_weight * step_losses[-1]
-            loss_total = loss_total + args.lambda_intermediate * intermediate_loss
-            intermediate_meter.update(intermediate_loss.item())
+            mask_loss, _, _ = _mask_bce_loss(logits_steps, mask_gt, args)
+            loss_total = loss_total + mask_loss
 
             per_step, per_transition = collect_step_metrics(
                 logits_steps, out["delta_logits_steps"], out["prob_shift_steps"],
@@ -447,8 +453,7 @@ def train_epoch(train_loader, model, optimizer, args):
         loss_meter.update(loss_total.item())
 
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
-    metrics = {"intermediate_mask_loss": intermediate_meter.avg}
-    metrics.update(compute_aggregate_diagnostics(step_metrics))
+    metrics = compute_refinement_diagnostics(step_metrics) if args.use_bce else {}
     return loss_meter.avg, metrics, step_metrics
 
 
@@ -461,9 +466,7 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
     avg_shift_last_meter = AverageMeter()
     total_disp_meter = AverageMeter()
     disp_std_meter = AverageMeter()
-    intermediate_meter = AverageMeter()
     step_accumulator = {"per_step": {}, "per_transition": {}}
-    all_probs_final, all_probs_step0, all_labels = [], [], []
 
     outdir = args.checkpoint.split('/')[-1]
     for data in loader:
@@ -509,19 +512,14 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
 
             if args.use_bce:
                 mask_gt = data.mask.unsqueeze(1)
-                step_losses, intermediate_loss = compute_mask_bce(logits_steps, mask_gt)
-                loss_total += args.bce_loss_weight * step_losses[-1]
-                loss_total += args.lambda_intermediate * intermediate_loss
-                intermediate_meter.update(intermediate_loss.item())
+                mask_loss, _, _ = _mask_bce_loss(logits_steps, mask_gt, args)
+                loss_total = loss_total + mask_loss
 
                 per_step, per_transition = collect_step_metrics(
                     logits_steps, out["delta_logits_steps"], out["prob_shift_steps"],
                     out["gate_entropy_steps"], mask_gt, args.num_experts,
                 )
                 merge_step_metrics(step_accumulator, per_step, per_transition)
-                all_probs_final.append(torch.sigmoid(logits_steps[-1]).cpu().numpy().reshape(-1))
-                all_probs_step0.append(torch.sigmoid(logits_steps[0]).cpu().numpy().reshape(-1))
-                all_labels.append(mask_gt.cpu().numpy().reshape(-1))
 
             loss_meter.update(loss_total.item())
 
@@ -530,15 +528,10 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
         'avg_shift_last': avg_shift_last_meter.avg,
         'total_disp': total_disp_meter.avg,
         'disp_std': disp_std_meter.avg,
-        'intermediate_mask_loss': intermediate_meter.avg,
     }
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
-
-    if args.use_bce and all_labels:
-        metrics.update(compute_mask_classification_metrics(
-            np.concatenate(all_probs_final), np.concatenate(all_labels)
-        ))
-        metrics.update(compute_aggregate_diagnostics(step_metrics))
+    if args.use_bce:
+        metrics.update(compute_refinement_diagnostics(step_metrics))
 
     return loss_meter.avg, metrics, step_metrics
 
@@ -568,6 +561,7 @@ if __name__ == '__main__':
     parser.add_argument('--ms_loss_weight', default=2.0, type=float)
     parser.add_argument('--use_bce', action='store_true')
     parser.add_argument('--bce_loss_weight', default=0.1, type=float)
+    parser.add_argument('--seed', default=42, type=int)
 
     add_refinement_args(parser)
     args = parser.parse_args()
