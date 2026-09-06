@@ -429,7 +429,6 @@ def main(args):
         best_ckpt = torch.load(best_path, map_location=device)
         best_epoch = best_ckpt['epoch']
         model.load_state_dict(best_ckpt['state_dict'])
-        mlflow.log_artifact(best_path, artifact_path="checkpoints")
 
         test_loss, test_metrics, test_steps = evaluate(
             test_loader, model, args, save_result=True, best_epoch=best_epoch
