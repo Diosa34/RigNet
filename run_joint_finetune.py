@@ -16,7 +16,13 @@ from utils.os_utils import isdir, mkdir_p, isfile
 from utils.io_utils import output_point_cloud_ply
 from utils.log_args_to_mlflow import log_args_to_mlflow
 from utils.mask_refinement_config import add_refinement_args, apply_ablation_preset, SHARED_REFINEMENT
-from utils.mlflow_metrics import BestTracker, log_mask_f1_steps, log_gate_entropy_steps, compute_gate_entropy_mean
+from utils.mlflow_metrics import (
+    BestTracker,
+    log_mask_step_metrics,
+    log_gate_entropy_steps,
+    log_alpha_steps,
+    compute_gate_entropy_mean,
+)
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -25,6 +31,7 @@ from torch_geometric.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from models.GCN import JOINTNET_MASKNET_MEANSHIFT
+from models.iterative_mask_refinement import set_debug as set_refine_debug
 from datasets.skeleton_dataset import GraphDataset
 from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_with_average
 
@@ -34,9 +41,11 @@ from sklearn.metrics import precision_score, recall_score, f1_score, average_pre
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-REFINE_LR = 5e-5
+REFINE_LR_DEFAULT = 5e-5  # refinement is trained from scratch, unlike the pretrained backbones
 MEANSHIFT_METRICS = ("cd_after", "avg_shift_last", "total_disp", "disp_std")
 REFINEMENT_METRICS = ("mask_f1_improvement", "refine_delta_logit_mean", "mask_prob_shift_mean")
+# Logged separately so that runs with and without --use_bce remain comparable.
+LOSS_COMPONENTS = ("base_loss", "bce_final", "bce_intermediate")
 
 
 def set_seed(seed):
@@ -56,12 +65,15 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
 
 
-def verify_optimizer_excludes_jointnet(model, optimizer):
+def verify_optimizer_scope(model, optimizer):
     optim_ids = {id(p) for group in optimizer.param_groups for p in group['params']}
     for p in model.jointnet.parameters():
-        assert id(p) not in optim_ids
+        assert id(p) not in optim_ids, "JointNet must not be in the optimizer"
+    if model._masknet_frozen:
+        for p in model.masknet.parameters():
+            assert id(p) not in optim_ids, "frozen MaskNet must not be in the optimizer"
     trainable = [p for p in model.parameters() if p.requires_grad]
-    assert all(id(p) in optim_ids for p in trainable)
+    assert all(id(p) in optim_ids for p in trainable), "some trainable params are not optimized"
 
 
 def pairwise_distances(x, y):
@@ -91,7 +103,7 @@ def compute_mask_bce_split(logits_steps, mask_gt):
     L_final = BCE(logits_T, mask_gt)
     L_intermediate = mean(BCE(logits_t, mask_gt) for t in 1..T-1)
     Step0 (initial MaskNet) and final step T are excluded from L_intermediate.
-    For T=1 (num_refine_steps=1): L_intermediate = 0.
+    For T <= 1: L_intermediate = 0.
     """
     mask_gt = mask_gt.float()
     T = len(logits_steps) - 1
@@ -221,11 +233,12 @@ def main(args):
     else:
         device = torch.device("cpu")
     args = apply_ablation_preset(args)
+    set_refine_debug(args.refine_debug)
     set_seed(getattr(args, 'seed', 42))
 
     lowest_val_loss = 1e20
     best_tracker = BestTracker(
-        lower_better={"loss"} | set(MEANSHIFT_METRICS),
+        lower_better={"loss"} | set(LOSS_COMPONENTS) | set(MEANSHIFT_METRICS),
         higher_better=set(REFINEMENT_METRICS),
     )
 
@@ -242,42 +255,52 @@ def main(args):
         shared_refinement=SHARED_REFINEMENT,
     ).to(device)
 
-    optimizer = torch.optim.Adam([
-        {'params': model.masknet.parameters(), 'lr': args.masknet_lr},
-        {'params': model.refinement.parameters(), 'lr': REFINE_LR},
-        {'params': [model.bandwidth], 'lr': args.bandwidth_lr},
-    ], weight_decay=args.weight_decay)
-
     if args.resume and isfile(args.resume):
         print("=> loading checkpoint '{}'".format(args.resume))
         checkpoint = torch.load(args.resume, map_location=device)
         args.start_epoch = checkpoint['epoch']
         lowest_val_loss = checkpoint['lowest_loss']
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        best_tracker = checkpoint.get('best_tracker')
-        if not isinstance(best_tracker, BestTracker):
-            best_tracker = BestTracker(
-                lower_better={"loss"} | set(MEANSHIFT_METRICS),
-                higher_better=set(REFINEMENT_METRICS),
-            )
-        try:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        except ValueError:
-            print("=> optimizer incompatible; starting fresh optimizer")
+        resumed_tracker = checkpoint.get('best_tracker')
+        if isinstance(resumed_tracker, BestTracker):
+            best_tracker = resumed_tracker
         print("=> loaded checkpoint (epoch {})".format(checkpoint['epoch']))
     else:
+        checkpoint = None
         model.masknet.load_state_dict(torch.load(args.masknet_resume, map_location=device)['state_dict'])
         model.jointnet.load_state_dict(torch.load(args.jointnet_resume, map_location=device)['state_dict'])
 
     model.freeze_jointnet()
     model.verify_jointnet_frozen()
-    verify_optimizer_excludes_jointnet(model, optimizer)
+    if args.freeze_masknet:
+        model.freeze_masknet()
+        model.verify_masknet_frozen()
+
+    group_index = {}
+    param_groups = []
+    if not args.freeze_masknet:
+        group_index['masknet'] = len(param_groups)
+        param_groups.append({'params': list(model.masknet.parameters()), 'lr': args.masknet_lr})
+    group_index['refinement'] = len(param_groups)
+    param_groups.append({'params': list(model.refinement.parameters()), 'lr': args.refine_lr})
+    group_index['bandwidth'] = len(param_groups)
+    param_groups.append({'params': [model.bandwidth], 'lr': args.bandwidth_lr})
+    optimizer = torch.optim.Adam(param_groups, weight_decay=args.weight_decay)
+
+    if checkpoint is not None:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError:
+            print("=> optimizer incompatible; starting fresh optimizer")
+
+    verify_optimizer_scope(model, optimizer)
 
     cudnn.benchmark = True
-    print('    Trainable params: %.2fM (JointNet frozen)' % (
-        sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6))
-    print('    Refinement: steps=%d experts=%d shared=True' % (
-        args.num_refine_steps, args.num_experts))
+    print('    Trainable params: %.3fM (JointNet frozen, MaskNet %s)' % (
+        sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6,
+        'frozen' if args.freeze_masknet else 'trainable'))
+    print('    Refinement: steps=%d experts=%d shared=True use_bce=%s' % (
+        args.num_refine_steps, args.num_experts, args.use_bce))
 
     train_loader = DataLoader(GraphDataset(root=args.train_folder), batch_size=args.train_batch,
                               shuffle=True, follow_batch=['joints'])
@@ -286,26 +309,49 @@ def main(args):
     test_loader = DataLoader(GraphDataset(root=args.test_folder), batch_size=args.test_batch,
                              shuffle=False, follow_batch=['joints'])
 
-    if args.evaluate:
-        _, val_metrics, _ = evaluate(val_loader, model, args)
-        _, test_metrics, _ = evaluate(test_loader, model, args, save_result=True, best_epoch=args.start_epoch)
-        print('val:', val_metrics)
-        print('test:', test_metrics)
-        return
-
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
-    logger = SummaryWriter(log_dir=args.logdir)
     run_name = args.ablation or f"refine_s{args.num_refine_steps}_e{args.num_experts}"
-
     mlflow.set_experiment("RigNet_Joint_Finetune")
-    with mlflow.start_run(run_name=run_name):
+
+    def log_run_params():
         log_args_to_mlflow(args)
         mlflow.log_param("device", str(device))
         mlflow.log_param("jointnet_frozen", True)
+        mlflow.log_param("masknet_frozen", bool(args.freeze_masknet))
         mlflow.log_param("shared_refinement", True)
         mlflow.log_param("num_refine_steps", args.num_refine_steps)
         mlflow.log_param("num_experts", args.num_experts)
         mlflow.log_param("lambda_intermediate", args.lambda_intermediate)
+        mlflow.log_param("bce_in_loss", bool(args.use_bce))
+
+    if args.evaluate:
+        with mlflow.start_run(run_name=f"{run_name}_eval"):
+            log_run_params()
+            val_loss, val_metrics, val_steps = evaluate(val_loader, model, args)
+            test_loss, test_metrics, test_steps = evaluate(
+                test_loader, model, args, save_result=True, best_epoch=args.start_epoch
+            )
+            print('val_loss {:.6f} | test_loss {:.6f}'.format(val_loss, test_loss))
+            for split, loss, metrics, steps in (
+                ("val", val_loss, val_metrics, val_steps),
+                ("test", test_loss, test_metrics, test_steps),
+            ):
+                print(split + ':')
+                for k, v in metrics.items():
+                    print('  {}: {:.6f}'.format(k, v))
+                mlflow.log_metric(f"{split}_loss", loss)
+                for k in LOSS_COMPONENTS + MEANSHIFT_METRICS:
+                    mlflow.log_metric(f"{split}_{k}", float(metrics[k]))
+                for k in REFINEMENT_METRICS:
+                    mlflow.log_metric(f"{split}_{k}", float(metrics.get(k, 0.0)))
+                log_mask_step_metrics(split, steps, 0)
+                log_gate_entropy_steps(split, steps, 0, args.num_experts)
+        return
+
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.schedule, gamma=args.gamma)
+    logger = SummaryWriter(log_dir=args.logdir)
+
+    with mlflow.start_run(run_name=run_name):
+        log_run_params()
 
         for epoch in range(args.start_epoch, args.epochs):
             print('\nEpoch: %d' % (epoch + 1))
@@ -316,13 +362,30 @@ def main(args):
 
             print('Epoch{:d}. train_loss: {:.6f}. val_loss: {:.6f}. test_loss: {:.6f}.'.format(
                 epoch + 1, train_loss, val_loss, test_loss))
+            print('  base_loss  train {:.6f} / val {:.6f} / test {:.6f}'.format(
+                train_metrics['base_loss'], val_metrics['base_loss'], test_metrics['base_loss']))
+            print('  mask_bce   train {:.6f} / val {:.6f} / test {:.6f}'.format(
+                train_metrics['bce_final'], val_metrics['bce_final'], test_metrics['bce_final']))
 
             mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
             mlflow.log_metric("val_loss", val_loss, step=epoch + 1)
             mlflow.log_metric("test_loss", test_loss, step=epoch + 1)
             mlflow.log_metric("lr_jointnet", 0.0, step=epoch + 1)  # frozen
-            mlflow.log_metric("lr_masknet", optimizer.param_groups[0]['lr'], step=epoch + 1)
-            mlflow.log_metric("lr_bandwidth", optimizer.param_groups[2]['lr'], step=epoch + 1)
+            mlflow.log_metric(
+                "lr_masknet",
+                0.0 if args.freeze_masknet else optimizer.param_groups[group_index['masknet']]['lr'],
+                step=epoch + 1,
+            )
+            mlflow.log_metric("lr_refinement",
+                              optimizer.param_groups[group_index['refinement']]['lr'], step=epoch + 1)
+            mlflow.log_metric("lr_bandwidth",
+                              optimizer.param_groups[group_index['bandwidth']]['lr'], step=epoch + 1)
+            mlflow.log_metric("bandwidth", float(model.bandwidth.detach().cpu()), step=epoch + 1)
+
+            for split, metrics in (("train", train_metrics), ("val", val_metrics), ("test", test_metrics)):
+                for key in LOSS_COMPONENTS:
+                    mlflow.log_metric(f"{split}_{key}", float(metrics[key]), step=epoch + 1)
+                    logger.add_scalar(f"{split}/{key}", float(metrics[key]), epoch + 1)
 
             for k in MEANSHIFT_METRICS:
                 mlflow.log_metric(f"val_{k}", float(val_metrics[k]), step=epoch + 1)
@@ -334,16 +397,17 @@ def main(args):
             logger.add_scalar("val/loss", val_loss, epoch + 1)
             logger.add_scalar("test/loss", test_loss, epoch + 1)
 
-            # --- iterative / MoR metrics ---
-            if args.use_bce:
-                for split, metrics in (("train", train_metrics), ("val", val_metrics), ("test", test_metrics)):
-                    for key in REFINEMENT_METRICS:
-                        mlflow.log_metric(f"{split}_{key}", metrics.get(key, 0.0), step=epoch + 1)
-                    if args.num_experts > 1 and "gate_entropy" in metrics:
-                        mlflow.log_metric(f"{split}_gate_entropy", metrics["gate_entropy"], step=epoch + 1)
-                for prefix, steps in (("train", train_steps), ("val", val_steps), ("test", test_steps)):
-                    log_mask_f1_steps(prefix, steps, epoch + 1)
-                    log_gate_entropy_steps(prefix, steps, epoch + 1, args.num_experts)
+            # Refinement diagnostics are independent of whether BCE enters the loss.
+            for split, metrics in (("train", train_metrics), ("val", val_metrics), ("test", test_metrics)):
+                for key in REFINEMENT_METRICS:
+                    mlflow.log_metric(f"{split}_{key}", metrics.get(key, 0.0), step=epoch + 1)
+                if args.num_experts > 1 and "gate_entropy" in metrics:
+                    mlflow.log_metric(f"{split}_gate_entropy", metrics["gate_entropy"], step=epoch + 1)
+            for prefix, steps in (("train", train_steps), ("val", val_steps), ("test", test_steps)):
+                log_mask_step_metrics(prefix, steps, epoch + 1)
+                log_gate_entropy_steps(prefix, steps, epoch + 1, args.num_experts)
+            if args.num_refine_steps > 0:
+                log_alpha_steps(model.refinement.alpha.detach().cpu().tolist(), epoch + 1)
 
             best_tracker.update(val_metrics, val_loss, epoch + 1)
 
@@ -375,32 +439,32 @@ def main(args):
             print('  {}: {:.6f}'.format(k, v))
 
         mlflow.log_metric("test_loss", test_loss)
-        for k in MEANSHIFT_METRICS:
+        for k in LOSS_COMPONENTS + MEANSHIFT_METRICS:
             mlflow.log_metric(f"test_{k}", float(test_metrics[k]))
-        if args.use_bce:
-            for key in REFINEMENT_METRICS:
-                mlflow.log_metric(f"test_{key}", test_metrics.get(key, 0.0))
-            if args.num_experts > 1 and "gate_entropy" in test_metrics:
-                mlflow.log_metric("test_gate_entropy", test_metrics["gate_entropy"])
-            log_mask_f1_steps("test", test_steps, best_epoch)
-            log_gate_entropy_steps("test", test_steps, best_epoch, args.num_experts)
+        for key in REFINEMENT_METRICS:
+            mlflow.log_metric(f"test_{key}", test_metrics.get(key, 0.0))
+        if args.num_experts > 1 and "gate_entropy" in test_metrics:
+            mlflow.log_metric("test_gate_entropy", test_metrics["gate_entropy"])
+        log_mask_step_metrics("test", test_steps, best_epoch)
+        log_gate_entropy_steps("test", test_steps, best_epoch, args.num_experts)
 
 
-def _mask_bce_loss(logits_steps, mask_gt, args):
-    final_loss, intermediate_loss = compute_mask_bce_split(logits_steps, mask_gt)
-    return (
-        args.bce_loss_weight * final_loss + args.lambda_intermediate * intermediate_loss,
-        final_loss,
-        intermediate_loss,
-    )
+def _mask_losses(logits_steps, mask_gt, args):
+    """BCE components; computed as metrics even when they do not enter the loss."""
+    if args.use_bce:
+        return compute_mask_bce_split(logits_steps, mask_gt)
+    with torch.no_grad():
+        return compute_mask_bce_split(logits_steps, mask_gt)
 
 
 def train_epoch(train_loader, model, optimizer, args):
     global device
-    model.train()
-    model.jointnet.eval()
+    model.train()  # frozen submodules stay in eval via JOINTNET_MASKNET_MEANSHIFT.train
 
     loss_meter = AverageMeter()
+    base_meter = AverageMeter()
+    bce_final_meter = AverageMeter()
+    bce_inter_meter = AverageMeter()
     step_accumulator = {"per_step": {}, "per_transition": {}}
 
     for data in train_loader:
@@ -413,33 +477,46 @@ def train_epoch(train_loader, model, optimizer, args):
         bandwidth = out["bandwidth"]
         logits_steps = out["logits_steps"]
 
-        loss_total = 0.0
+        base_loss = 0.0
         num_graphs = len(torch.unique(data.batch))
         for i in range(num_graphs):
             joint_gt = data.joints[data.joints_batch == i, :]
             q_i = q_pred[data.batch == i, :]
             mask_i = mask_prob[data.batch == i]
             cd_before, _, loss_ms, _ = joint_meanshift_loss(q_i, mask_i, bandwidth, joint_gt, args)
-            loss_total += cd_before + args.ms_loss_weight * loss_ms
-        loss_total /= num_graphs
+            base_loss = base_loss + cd_before + args.ms_loss_weight * loss_ms
+        base_loss = base_loss / num_graphs
 
+        mask_gt = data.mask.unsqueeze(1)
+        bce_final, bce_inter = _mask_losses(logits_steps, mask_gt, args)
+
+        loss_total = base_loss
         if args.use_bce:
-            mask_gt = data.mask.unsqueeze(1)
-            mask_loss, _, _ = _mask_bce_loss(logits_steps, mask_gt, args)
-            loss_total = loss_total + mask_loss
+            loss_total = loss_total + args.bce_loss_weight * bce_final \
+                + args.lambda_intermediate * bce_inter
 
+        with torch.no_grad():
             per_step, per_transition = collect_step_metrics(
                 logits_steps, out["delta_logits_steps"], out["prob_shift_steps"],
                 out["gate_entropy_steps"], mask_gt, args.num_experts,
             )
-            merge_step_metrics(step_accumulator, per_step, per_transition)
+        merge_step_metrics(step_accumulator, per_step, per_transition)
 
         loss_total.backward()
         optimizer.step()
+
         loss_meter.update(loss_total.item())
+        base_meter.update(base_loss.item())
+        bce_final_meter.update(bce_final.item())
+        bce_inter_meter.update(bce_inter.item())
 
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
-    metrics = compute_refinement_diagnostics(step_metrics, args.num_experts) if args.use_bce else {}
+    metrics = compute_refinement_diagnostics(step_metrics, args.num_experts)
+    metrics.update({
+        'base_loss': base_meter.avg,
+        'bce_final': bce_final_meter.avg,
+        'bce_intermediate': bce_inter_meter.avg,
+    })
     return loss_meter.avg, metrics, step_metrics
 
 
@@ -448,6 +525,9 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
     model.eval()
 
     loss_meter = AverageMeter()
+    base_meter = AverageMeter()
+    bce_final_meter = AverageMeter()
+    bce_inter_meter = AverageMeter()
     cd_after_meter = AverageMeter()
     avg_shift_last_meter = AverageMeter()
     total_disp_meter = AverageMeter()
@@ -464,7 +544,7 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
             bandwidth = out["bandwidth"]
             logits_steps = out["logits_steps"]
 
-            loss_total = 0.0
+            base_loss = 0.0
             num_graphs = len(torch.unique(data.batch))
 
             for i in range(num_graphs):
@@ -475,7 +555,7 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
                 cd_before, cd_after, loss_ms, clustered = joint_meanshift_loss(
                     q_i, mask_i, bandwidth, joint_gt, args
                 )
-                loss_total += cd_before + args.ms_loss_weight * loss_ms
+                base_loss = base_loss + cd_before + args.ms_loss_weight * loss_ms
                 cd_after_meter.update(cd_after.item())
 
                 if len(clustered) >= 2:
@@ -494,30 +574,38 @@ def evaluate(loader, model, args, save_result=False, best_epoch=None):
                     np.save(os.path.join(folder, '{:d}_bandwidth.npy'.format(data.name[i].item())),
                             bandwidth.cpu().numpy())
 
-            loss_total /= num_graphs
+            base_loss = base_loss / num_graphs
 
+            mask_gt = data.mask.unsqueeze(1)
+            bce_final, bce_inter = compute_mask_bce_split(logits_steps, mask_gt)
+
+            loss_total = base_loss
             if args.use_bce:
-                mask_gt = data.mask.unsqueeze(1)
-                mask_loss, _, _ = _mask_bce_loss(logits_steps, mask_gt, args)
-                loss_total = loss_total + mask_loss
+                loss_total = loss_total + args.bce_loss_weight * bce_final \
+                    + args.lambda_intermediate * bce_inter
 
-                per_step, per_transition = collect_step_metrics(
-                    logits_steps, out["delta_logits_steps"], out["prob_shift_steps"],
-                    out["gate_entropy_steps"], mask_gt, args.num_experts,
-                )
-                merge_step_metrics(step_accumulator, per_step, per_transition)
+            per_step, per_transition = collect_step_metrics(
+                logits_steps, out["delta_logits_steps"], out["prob_shift_steps"],
+                out["gate_entropy_steps"], mask_gt, args.num_experts,
+            )
+            merge_step_metrics(step_accumulator, per_step, per_transition)
 
             loss_meter.update(loss_total.item())
+            base_meter.update(base_loss.item())
+            bce_final_meter.update(bce_final.item())
+            bce_inter_meter.update(bce_inter.item())
 
     metrics = {
         'cd_after': cd_after_meter.avg,
         'avg_shift_last': avg_shift_last_meter.avg,
         'total_disp': total_disp_meter.avg,
         'disp_std': disp_std_meter.avg,
+        'base_loss': base_meter.avg,
+        'bce_final': bce_final_meter.avg,
+        'bce_intermediate': bce_inter_meter.avg,
     }
     step_metrics = average_step_metrics(step_accumulator) if step_accumulator["per_step"] else None
-    if args.use_bce:
-        metrics.update(compute_refinement_diagnostics(step_metrics, args.num_experts))
+    metrics.update(compute_refinement_diagnostics(step_metrics, args.num_experts))
 
     return loss_meter.avg, metrics, step_metrics
 
@@ -539,6 +627,8 @@ if __name__ == '__main__':
     parser.add_argument('--val_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/val/', type=str)
     parser.add_argument('--test_folder', default='/media/zhanxu/4T/ModelResource_RigNetv1_preproccessed/test/', type=str)
     parser.add_argument('--masknet_lr', default=5e-5, type=float)
+    parser.add_argument('--refine_lr', default=REFINE_LR_DEFAULT, type=float,
+                        help='LR for the from-scratch refinement head (may exceed the backbone LRs)')
     parser.add_argument('--bandwidth_lr', default=1e-6, type=float)
     parser.add_argument('--jointnet_resume', default='checkpoints/pretrain_jointnet/model_best.pth.tar', type=str)
     parser.add_argument('--masknet_resume', default='checkpoints/pretrain_masknet/model_best.pth.tar', type=str)

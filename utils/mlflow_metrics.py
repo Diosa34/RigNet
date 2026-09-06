@@ -2,6 +2,8 @@
 # MLflow metric helpers aligned with baseline RigNet naming conventions.
 #-------------------------------------------------------------------------------
 
+STEP_METRIC_KEYS = ("mask_loss", "mask_f1", "mask_precision", "mask_recall", "mask_pr_auc")
+
 
 class BestTracker:
     """Track best validation metrics across epochs."""
@@ -34,14 +36,15 @@ class BestTracker:
                 mlflow.log_param(f"{prefix}_{key}_epoch", int(self.epochs[key]))
 
 
-def log_mask_f1_steps(prefix, step_metrics, epoch):
-    """Diagnostic per-step F1: mask_f1_step0 .. mask_f1_stepT."""
+def log_mask_step_metrics(prefix, step_metrics, epoch):
+    """Per-step mask diagnostics: mask_f1_step0..T, mask_loss_step0..T, etc."""
     import mlflow
     if not step_metrics or "per_step" not in step_metrics:
         return
     for t, sm in step_metrics["per_step"].items():
-        if "mask_f1" in sm:
-            mlflow.log_metric(f"{prefix}_mask_f1_step{t}", sm["mask_f1"], step=epoch)
+        for key in STEP_METRIC_KEYS:
+            if key in sm:
+                mlflow.log_metric(f"{prefix}_{key}_step{t}", float(sm[key]), step=epoch)
 
 
 def log_gate_entropy_steps(prefix, step_metrics, epoch, num_experts):
@@ -51,7 +54,14 @@ def log_gate_entropy_steps(prefix, step_metrics, epoch, num_experts):
         return
     for t, tr in step_metrics.get("per_transition", {}).items():
         if "gate_entropy" in tr:
-            mlflow.log_metric(f"{prefix}_gate_entropy_step{t}", tr["gate_entropy"], step=epoch)
+            mlflow.log_metric(f"{prefix}_gate_entropy_step{t}", float(tr["gate_entropy"]), step=epoch)
+
+
+def log_alpha_steps(alpha_values, epoch):
+    """Learned residual damping per refinement step."""
+    import mlflow
+    for t, val in enumerate(alpha_values):
+        mlflow.log_metric(f"refine_alpha_step{t}", float(val), step=epoch)
 
 
 def compute_gate_entropy_mean(step_metrics):

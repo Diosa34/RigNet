@@ -117,6 +117,7 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
             gating_hidden_dim=gating_hidden_dim,
         )
         self._jointnet_frozen = False
+        self._masknet_frozen = False
 
     def freeze_jointnet(self):
         """Freeze JointNet: no gradients, eval mode, detached forward."""
@@ -132,6 +133,27 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
             assert not param.requires_grad, f"JointNet param {name} still requires grad"
         assert not any(p.requires_grad for p in self.jointnet.parameters())
 
+    def freeze_masknet(self):
+        """Freeze MaskNet: refinement then sees deterministic, stationary h and logits_0."""
+        for param in self.masknet.parameters():
+            param.requires_grad = False
+        self.masknet.eval()
+        self._masknet_frozen = True
+
+    def verify_masknet_frozen(self):
+        assert self._masknet_frozen, "freeze_masknet() was not called"
+        for name, param in self.masknet.named_parameters():
+            assert not param.requires_grad, f"MaskNet param {name} still requires grad"
+
+    def train(self, mode=True):
+        """Keep frozen submodules in eval mode so dropout/BatchNorm stay deterministic."""
+        super(JOINTNET_MASKNET_MEANSHIFT, self).train(mode)
+        if self._jointnet_frozen:
+            self.jointnet.eval()
+        if self._masknet_frozen:
+            self.masknet.eval()
+        return self
+
     def forward(self, data, return_refinement=False):
         if self._jointnet_frozen:
             with torch.no_grad():
@@ -140,9 +162,16 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
         else:
             x_offset = self.jointnet(data)
 
-        encoded = self.masknet.encode(data)
-        h = encoded["h"]
-        logits_0 = self.masknet.decode(encoded)
+        if self._masknet_frozen:
+            with torch.no_grad():
+                encoded = self.masknet.encode(data)
+                logits_0 = self.masknet.decode(encoded)
+            h = encoded["h"].detach()
+            logits_0 = logits_0.detach()
+        else:
+            encoded = self.masknet.encode(data)
+            h = encoded["h"]
+            logits_0 = self.masknet.decode(encoded)
 
         refine_out = self.refinement(h, data.pos, x_offset, logits_0, data.batch)
         mask_logits = refine_out["logits_steps"][-1]
@@ -162,6 +191,7 @@ class JOINTNET_MASKNET_MEANSHIFT(torch.nn.Module):
                 "delta_logits_steps": refine_out["delta_logits_steps"],
                 "gate_entropy_steps": refine_out["gate_entropy_steps"],
                 "prob_shift_steps": refine_out["prob_shift_steps"],
+                "alpha_steps": refine_out["alpha_steps"],
                 "h": h,
                 "q_final": q_final,
             }

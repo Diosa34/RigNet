@@ -1,14 +1,32 @@
 #-------------------------------------------------------------------------------
 # Iterative mask / attention refinement with optional Mixture-of-Recursion (MoR).
-# Updates logits via residual deltas: logits_{t+1} = logits_t + Δlogits_t.
+# logits_{t+1} = logits_t + alpha_t * tanh(raw_delta_t)
 # attention_t = sigmoid(logits_t) — never updated directly.
-# Each step: q_t = pos + displacement_t; experts receive [h, q_t - pos, attention_t].
+# Each step: q_t = pos + displacement_t; experts receive [LayerNorm(h), q_t - pos, attention_t].
+# The delta head is zero-initialised, so refinement is the identity at initialisation
+# and num_refine_steps=0 reproduces the plain MaskNet prediction exactly.
 #-------------------------------------------------------------------------------
+import os
 import torch
-from torch.nn import Module, ModuleList, Sequential, Linear, ReLU
+from torch.nn import Module, ModuleList, Sequential, Linear, ReLU, LayerNorm, Parameter
+
+# Shape/finiteness invariants are expensive on every forward (nonzero scans per graph),
+# so they are opt-in via --refine_debug or REFINE_DEBUG=1.
+_DEBUG = os.environ.get("REFINE_DEBUG", "0") == "1"
+
+
+def set_debug(enabled):
+    global _DEBUG
+    _DEBUG = bool(enabled)
+
+
+def debug_enabled():
+    return _DEBUG
 
 
 def _assert_batch_offsets(batch, num_vertices):
+    if not _DEBUG:
+        return
     assert batch.shape[0] == num_vertices
     assert batch.dim() == 1
     assert batch.dtype in (torch.int32, torch.int64)
@@ -25,17 +43,23 @@ def _assert_batch_offsets(batch, num_vertices):
 
 
 def _assert_finite(name, tensor):
+    if not _DEBUG:
+        return
     assert not torch.isnan(tensor).any(), f"{name} contains NaN"
     assert not torch.isinf(tensor).any(), f"{name} contains Inf"
 
 
 def _assert_vertex_consistent(*tensors):
+    if not _DEBUG:
+        return
     n = tensors[0].shape[0]
     for t in tensors[1:]:
         assert t.shape[0] == n, "all per-vertex tensors must share the same vertex count"
 
 
 def _assert_q_t(q_t, pos, displacement_t):
+    if not _DEBUG:
+        return
     _assert_vertex_consistent(q_t, pos, displacement_t)
     assert q_t.shape[1] == 3 and pos.shape[1] == 3 and displacement_t.shape[1] == 3
     _assert_finite("q_t", q_t)
@@ -43,6 +67,8 @@ def _assert_q_t(q_t, pos, displacement_t):
 
 
 def _assert_attention_from_logits(logits, attention, step_label=""):
+    if not _DEBUG:
+        return
     assert logits.shape == attention.shape
     expected = torch.sigmoid(logits)
     assert torch.allclose(attention, expected, atol=1e-5, rtol=1e-5), (
@@ -53,6 +79,8 @@ def _assert_attention_from_logits(logits, attention, step_label=""):
 
 def _assert_gate_weights(gate_weights, num_experts):
     """Per-vertex softmax over expert dimension; no cross-graph mixing in gating."""
+    if not _DEBUG:
+        return
     assert gate_weights.dim() == 2
     assert gate_weights.shape[1] == num_experts
     _assert_finite("gate_weights", gate_weights)
@@ -64,7 +92,7 @@ def _assert_gate_weights(gate_weights, num_experts):
 
 
 class RefinementExpert(Module):
-    """Per-vertex expert: [h, q_t - pos, attention_t] -> Δlogits."""
+    """Per-vertex expert: [h, q_t - pos, attention_t] -> raw delta logit."""
 
     def __init__(self, h_dim, hidden_dim):
         super().__init__()
@@ -76,14 +104,14 @@ class RefinementExpert(Module):
             ReLU(),
             Linear(hidden_dim // 2, 1),
         )
+        # Identity at initialisation: the refined logits start exactly at MaskNet's.
+        torch.nn.init.zeros_(self.mlp[-1].weight)
+        torch.nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, h, rel_displacement, attention):
-        assert h.shape[0] == rel_displacement.shape[0] == attention.shape[0]
         assert rel_displacement.shape[1] == 3 and attention.shape[1] == 1
         x = torch.cat([h, rel_displacement, attention], dim=1)
-        out = self.mlp(x)
-        assert out.shape == (h.shape[0], 1)
-        return out
+        return self.mlp(x)
 
 
 class GatingNetwork(Module):
@@ -116,12 +144,16 @@ class IterativeMaskRefinement(Module):
     State at step t:
       q_t = pos + displacement_t   (displacement_t = displacement_0 when JointNet frozen)
       rel = q_t - pos
-      input = [h, rel, attention_t]
-      logits_{t+1} = logits_t + Δlogits_t
+      input = [LayerNorm(h), rel, attention_t]
+      logits_{t+1} = logits_t + alpha_t * tanh(raw_delta_t)
       attention_{t+1} = sigmoid(logits_{t+1})
+
+    LayerNorm decouples the experts from MaskNet's BatchNorm train/eval statistics;
+    alpha_t damps the residual so that stacking steps cannot blow the logits up.
     """
 
     VALID_NUM_EXPERTS = (1, 2, 3)
+    ALPHA_INIT = 0.1
 
     def __init__(
         self,
@@ -133,7 +165,7 @@ class IterativeMaskRefinement(Module):
         gating_hidden_dim=128,
     ):
         super().__init__()
-        assert num_refine_steps >= 1
+        assert num_refine_steps >= 0
         assert num_experts in self.VALID_NUM_EXPERTS, (
             f"num_experts must be one of {self.VALID_NUM_EXPERTS}, got {num_experts}"
         )
@@ -142,6 +174,9 @@ class IterativeMaskRefinement(Module):
         self.num_refine_steps = num_refine_steps
         self.num_experts = num_experts
         self.shared_refinement = shared_refinement
+
+        self.h_norm = LayerNorm(h_dim)
+        self.alpha = Parameter(torch.full((max(num_refine_steps, 1),), self.ALPHA_INIT))
 
         if shared_refinement:
             self.experts = ModuleList([
@@ -155,19 +190,20 @@ class IterativeMaskRefinement(Module):
             self.gating = None
             self.step_experts = ModuleList([
                 ModuleList([RefinementExpert(h_dim, refine_hidden_dim) for _ in range(num_experts)])
-                for _ in range(num_refine_steps)
+                for _ in range(max(num_refine_steps, 1))
             ])
             self.step_gatings = ModuleList([
                 GatingNetwork(h_dim, num_experts, gating_hidden_dim) if num_experts > 1 else None
-                for _ in range(num_refine_steps)
+                for _ in range(max(num_refine_steps, 1))
             ])
 
     def _modules_for_step(self, step_idx):
         if self.shared_refinement:
             return self.experts, self.gating
-        return self.step_experts[step_idx], self.step_gatings[step_idx]
+        idx = min(step_idx, len(self.step_experts) - 1)
+        return self.step_experts[idx], self.step_gatings[idx]
 
-    def _compute_delta_logits(self, experts, gating, h, rel_displacement, attention, batch):
+    def _compute_raw_delta(self, experts, gating, h, rel_displacement, attention, batch):
         delta_per_expert = [expert(h, rel_displacement, attention) for expert in experts]
         if self.num_experts == 1:
             return delta_per_expert[0], None
@@ -179,7 +215,7 @@ class IterativeMaskRefinement(Module):
 
     def forward(self, h, pos, displacement_0, logits_0, batch, num_refine_steps=None):
         steps = num_refine_steps if num_refine_steps is not None else self.num_refine_steps
-        assert steps >= 1
+        assert steps >= 0
 
         _assert_vertex_consistent(h, pos, displacement_0, logits_0)
         assert h.shape[1] == self.h_dim
@@ -187,6 +223,8 @@ class IterativeMaskRefinement(Module):
         _assert_batch_offsets(batch, h.shape[0])
         for name, t in [("h", h), ("pos", pos), ("displacement_0", displacement_0), ("logits_0", logits_0)]:
             _assert_finite(name, t)
+
+        h_normed = self.h_norm(h)
 
         q_0 = pos + displacement_0
         _assert_q_t(q_0, pos, displacement_0)
@@ -200,6 +238,7 @@ class IterativeMaskRefinement(Module):
         delta_logits_steps = []
         gate_entropy_steps = []
         prob_shift_steps = []
+        alpha_steps = []
 
         for t in range(steps):
             logits_t = logits_steps[-1]
@@ -212,9 +251,11 @@ class IterativeMaskRefinement(Module):
             _assert_finite(f"rel_displacement_step_{t}", rel_displacement)
 
             experts, gating = self._modules_for_step(t)
-            delta_logits_t, gate_weights = self._compute_delta_logits(
-                experts, gating, h, rel_displacement, attention_t, batch
+            raw_delta_t, gate_weights = self._compute_raw_delta(
+                experts, gating, h_normed, rel_displacement, attention_t, batch
             )
+            alpha_t = self.alpha[min(t, self.alpha.numel() - 1)]
+            delta_logits_t = alpha_t * torch.tanh(raw_delta_t)
             _assert_finite(f"delta_logits_step_{t}", delta_logits_t)
             assert delta_logits_t.shape == (h.shape[0], 1)
 
@@ -228,6 +269,7 @@ class IterativeMaskRefinement(Module):
             logits_steps.append(logits_next)
             attention_steps.append(attention_next)
             delta_logits_steps.append(delta_logits_t)
+            alpha_steps.append(alpha_t.detach())
 
             displacement_next = displacement_0
             q_next = pos + displacement_next
@@ -243,8 +285,6 @@ class IterativeMaskRefinement(Module):
         assert len(logits_steps) == steps + 1
         assert len(attention_steps) == steps + 1
         assert len(q_steps) == steps + 1
-        for ls, at in zip(logits_steps, attention_steps):
-            assert ls.shape[0] == h.shape[0] and at.shape[0] == h.shape[0]
 
         return {
             "logits_steps": logits_steps,
@@ -254,4 +294,5 @@ class IterativeMaskRefinement(Module):
             "delta_logits_steps": delta_logits_steps,
             "gate_entropy_steps": gate_entropy_steps,
             "prob_shift_steps": prob_shift_steps,
+            "alpha_steps": alpha_steps,
         }
