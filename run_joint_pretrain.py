@@ -29,7 +29,6 @@ from models.supplemental_layers.pytorch_chamfer_dist import chamfer_distance_wit
 
 import mlflow
 import mlflow.pytorch
-import matplotlib.pyplot as plt
 
 from sklearn.metrics import (
     precision_score,

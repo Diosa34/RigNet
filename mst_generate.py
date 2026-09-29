@@ -38,8 +38,7 @@ from models.supplemental_layers.pytorch_chamfer_dist import (
 )
 
 
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def predict_joints(model_id, args):
@@ -211,12 +210,12 @@ def run_mst_generate(args):
     root_select_model = ROOTNET()
     root_select_model.to(device)
     root_select_model.eval()
-    root_checkpoint = torch.load(args.rootnet, map_location='cpu')
+    root_checkpoint = torch.load(args.rootnet)
     root_select_model.load_state_dict(root_checkpoint['state_dict'])
     connectivity_model = PairCls()
     connectivity_model.to(device)
     connectivity_model.eval()
-    conn_checkpoint = torch.load(args.bonenet, map_location='cpu')
+    conn_checkpoint = torch.load(args.bonenet)
     connectivity_model.load_state_dict(conn_checkpoint['state_dict'])
 
     # loading reference data from rig_info_remesh
@@ -246,6 +245,7 @@ def run_mst_generate(args):
         cost_matrix[pair_idx[:, 0], pair_idx[:, 1]] = connect_prob.data.cpu().numpy().squeeze()
         cost_matrix = cost_matrix + cost_matrix.transpose()
         cost_matrix = -np.log(cost_matrix+1e-10)
+        #cost_matrix = flip_cost_matrix(pred_joints, cost_matrix)
         cost_matrix = increase_cost_for_outside_bone(cost_matrix, pred_joints, vox)
 
         skel = Skel()

@@ -45,7 +45,6 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
 
 
 def get_bone_names(data_folder, sample_name):
-    """Load bone names from skin.txt file located in data_folder."""
     skin_filename = os.path.join(data_folder, "{:d}_skin.txt".format(sample_name))
     with open(skin_filename, 'r') as fin:
         lines = fin.readlines()

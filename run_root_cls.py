@@ -158,6 +158,7 @@ def train(train_loader, model, optimizer, args):
         loss_1 = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label, reduction='none')
         topk_val, _ = torch.topk(loss_1.view(-1), k=int(args.topk * len(pre_label)), dim=0, sorted=False)
         loss2 = topk_val.mean()
+        #loss_3 = torch.nn.functional.binary_cross_entropy_with_logits(pre_label, label)
         loss = loss_1.mean() + loss2
         loss.backward()
         optimizer.step()
@@ -167,13 +168,14 @@ def train(train_loader, model, optimizer, args):
 
 def test(test_loader, model):
     global device
-    model.eval()
+    model.eval()  # switch to test mode
     loss_meter = AverageMeter()
 
     all_preds = []
     all_gts = []
 
     for data in test_loader:
+        #print(data.name)
         data = data.to(device)
         with torch.no_grad():
             pre_label, label = model(data)
