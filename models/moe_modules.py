@@ -12,8 +12,8 @@ from torch.nn import Sequential, Linear, ReLU, LayerNorm, Module, ModuleList
 # Shared expert keeps an always-active MLP path; routed experts add specialization.
 MOE_NUM_EXPERTS = 4
 MOE_TOP_K = 2
-MOE_ROUTER_NOISE = 0.0
-MOE_ROUTER_TEMPERATURE = 0.5
+MOE_ROUTER_NOISE = 0.0 # noise can redistribute the weights among the routed experts so that the router doesn’t select the same experts repeatedly
+MOE_ROUTER_TEMPERATURE = 0.5 # exaggerates the router experts’ weights
 MOE_GATE_HIDDEN_RATIO = 4
 MOE_USE_SHARED_EXPERT = True
 
